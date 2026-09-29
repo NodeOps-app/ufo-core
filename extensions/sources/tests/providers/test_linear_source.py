@@ -4,7 +4,8 @@ the incremental `filter: { updatedAt: { gte } }` gate, a full-refresh stream (no
 threading no variables, the `render` override that lifts an issue/project into readable prose and
 titles a titleless comment off its body, the two rendered content streams naming only the fields the
 connector reads, a 403 surfacing as
-`StreamSkipped`, and a GraphQL `errors` array failing loud. No conftest: the shared
+`StreamSkipped`, a `FORBIDDEN` GraphQL error skipping the stream, and any other GraphQL `errors`
+array failing loud. No conftest: the shared
 `ufo_testsupport` plugin covers fixtures, and these tests are offline (a canned transport, no
 DB, no token, no broker)."""
 
@@ -187,6 +188,49 @@ async def test_forbidden_status_raises_stream_skipped() -> None:
 
     with pytest.raises(StreamSkipped, match="refused"):
         await _fetch("issues", handle)
+
+
+async def test_a_forbidden_graphql_error_skips_the_stream() -> None:
+    """Linear answers a stream the workspace's plan or the grant does not reach with a `FORBIDDEN`
+    error in place of `data`, so the stream is refused for this account, not broken."""
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "errors": [
+                    {
+                        "message": "Customer requests are not available in this workspace.",
+                        "extensions": {"code": "FORBIDDEN", "type": "forbidden"},
+                    }
+                ],
+                "data": None,
+            },
+        )
+
+    with pytest.raises(StreamSkipped) as raised:
+        await _fetch("customer_needs", handle)
+    assert raised.value.reason == (
+        "linear: 'customer_needs' refused: "
+        "Customer requests are not available in this workspace. [FORBIDDEN]"
+    )
+    assert raised.value.awaits_grant is False
+
+
+async def test_a_forbidden_error_beside_another_code_still_fails_loud() -> None:
+    def handle(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "errors": [
+                    {"message": "not available", "extensions": {"code": "FORBIDDEN"}},
+                    {"message": "boom", "extensions": {"code": "INTERNAL_SERVER_ERROR"}},
+                ]
+            },
+        )
+
+    with pytest.raises(StreamFault, match="graphql error"):
+        await _fetch("customers", handle)
 
 
 async def test_graphql_errors_fail_loud() -> None:

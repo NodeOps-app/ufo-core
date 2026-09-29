@@ -14,11 +14,13 @@ issue/project/comment/user into readable prose (title, description, state, assig
 default GraphQL-node JSON dump. A comment carries no title of its own, so a record that renders none
 takes its first body line and falls back to its `stream/id` identity: a page holds a non-empty
 title, and an empty one is a record the page model rejects and the run drops.
-A refusal (HTTP 401/403) raises `StreamSkipped` so the run records a skip; a GraphQL `errors` array
-raises `StreamFault` naming each error's message and code rather than commit a partial page. The
-credential is resolved through the auth proxy the runner threads (an OAuth bearer works on the base
-client unchanged); this connector holds no token. The write path (mutations) is intentionally
-absent — the source seam only reads."""
+A refusal (HTTP 401/403) raises `StreamSkipped` so the run records a skip, and so does a GraphQL
+`errors` array whose every code is `FORBIDDEN` — the answer Linear gives a stream the workspace's
+plan or the grant does not reach, such as customer requests on a workspace without them. Any other
+`errors` array raises `StreamFault` naming each error's message and code rather than commit a
+partial page. The credential is resolved through the auth proxy the runner threads (an OAuth
+bearer works on the base client unchanged); this connector holds no token. The write path
+(mutations) is intentionally absent — the source seam only reads."""
 
 from collections.abc import AsyncIterator
 from typing import Any
@@ -31,6 +33,7 @@ from ufo.sdk.sources import (
     StreamFault,
     StreamSkipped,
     StreamSpec,
+    dict_or_empty,
     graphql_fault,
     list_or_empty,
 )
@@ -39,6 +42,12 @@ from ufo_ext_sources.watermark import text_checkpoint
 GRAPHQL_PATH = "/graphql"
 ORDER_BY_UPDATED_AT = "updatedAt"
 _REFUSAL_STATUS = frozenset({401, 403})
+_REFUSAL_CODES = frozenset({"FORBIDDEN"})
+
+
+def _refused(errors: Any) -> bool:
+    codes = {dict_or_empty(item.get("extensions")).get("code") for item in list_or_empty(errors)}
+    return bool(codes) and codes <= _REFUSAL_CODES
 
 
 def _stream(
@@ -282,10 +291,12 @@ class LinearConnector(RestConnector):
                         "the grant is missing scope or the token is invalid"
                     ) from error
                 raise
-            if data.get("errors"):
-                raise StreamFault(
-                    f"linear: graphql error on {stream.name!r}: {graphql_fault(data['errors'])}"
-                )
+            errors = data.get("errors")
+            if errors:
+                fault = graphql_fault(errors)
+                if _refused(errors):
+                    raise StreamSkipped(f"linear: {stream.name!r} refused: {fault}")
+                raise StreamFault(f"linear: graphql error on {stream.name!r}: {fault}")
             payload = data.get("data")
             envelope = payload.get(root_field) if isinstance(payload, dict) else None
             if not isinstance(envelope, dict):
