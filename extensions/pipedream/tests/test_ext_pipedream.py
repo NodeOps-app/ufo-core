@@ -86,7 +86,6 @@ SECOND_PAGE_ACTION = "gmail-find-email"
 DISCOVERY_QUERY = "find an email from a sender"
 OAUTH_APP_ID = "oa_gmail_custom"
 GITHUB_OAUTH_APP_ENV = "PIPEDREAM_GITHUB_OAUTH_APP_ID"
-GITHUB_OAUTH_APP_ID = "oa_github_custom"
 
 
 @pytest.fixture(autouse=True)
@@ -431,21 +430,25 @@ async def test_oauth_route_start_leg_refuses_github_consent_on_the_shared_client
         await provider.oauth_route(ctx, _request(query))
 
 
-@pytest.mark.parametrize("name", [GITHUB_OAUTH_APP_ENV, f"UFO_{GITHUB_OAUTH_APP_ENV}"])
-async def test_oauth_route_start_leg_pins_github_consent_to_the_deploys_own_client(
-    name: str, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("connector", ["github", "linear", "attio"])
+@pytest.mark.parametrize("prefix", ["", "UFO_"])
+async def test_oauth_route_start_leg_pins_consent_to_the_deploys_own_client(
+    connector: str, prefix: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv(name, GITHUB_OAUTH_APP_ID)
+    name = f"PIPEDREAM_{connector.upper()}_OAUTH_APP_ID"
+    monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv(f"UFO_{name}", raising=False)
+    monkeypatch.setenv(f"{prefix}{name}", OAUTH_APP_ID)
     _install_transport(monkeypatch, _pipedream_handler("ufo_ws"))
     ctx = context_for(pipedream_manifest.NAME, frozenset())
-    query = f"provider=github&state=SEALED&callback={EXPECTED_REDIRECT_URI}"
+    query = f"provider={connector}&state=SEALED&callback={EXPECTED_REDIRECT_URI}"
     with ws(uuid4()):
         response = await provider.oauth_route(ctx, _request(query))
     assert response.status_code == provider.REDIRECT_STATUS
     assert response.headers["location"].startswith(CONNECT_LINK)
     link_query = parse_qs(urlparse(response.headers["location"]).query)
-    assert link_query["app"] == ["github"]
-    assert link_query["oauthAppId"] == [GITHUB_OAUTH_APP_ID]
+    assert link_query["app"] == [connector]
+    assert link_query["oauthAppId"] == [OAUTH_APP_ID]
 
 
 async def test_oauth_route_return_leg_resolves_the_state_scoped_account(

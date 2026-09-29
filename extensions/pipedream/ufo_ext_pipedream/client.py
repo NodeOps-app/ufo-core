@@ -99,7 +99,9 @@ class ConnectorSpec:
 
 
 CONNECTORS: dict[str, ConnectorSpec] = {
-    "attio": ConnectorSpec("Attio", "attio", "api.attio.com"),
+    "attio": ConnectorSpec(
+        "Attio", "attio", "api.attio.com", custom_oauth_env="PIPEDREAM_ATTIO_OAUTH_APP_ID"
+    ),
     "brex": ConnectorSpec("Brex", "brex", "platform.brexapis.com"),
     "confluence": ConnectorSpec("Confluence", "confluence", "api.atlassian.com"),
     "digital_ocean": ConnectorSpec("DigitalOcean", "digital_ocean", "api.digitalocean.com"),
@@ -116,7 +118,9 @@ CONNECTORS: dict[str, ConnectorSpec] = {
     "gmail": ConnectorSpec(
         "Gmail", "gmail", "gmail.googleapis.com", custom_oauth_env="PIPEDREAM_GMAIL_OAUTH_APP_ID"
     ),
-    "linear": ConnectorSpec("Linear", "linear", "api.linear.app"),
+    "linear": ConnectorSpec(
+        "Linear", "linear", "api.linear.app", custom_oauth_env="PIPEDREAM_LINEAR_OAUTH_APP_ID"
+    ),
     "pandadoc": ConnectorSpec("PandaDoc", "pandadoc", "api.pandadoc.com"),
     # Pipedrive and Shopify pin their API host per account — a Pipedrive company domain, a Shopify
     # shop — so neither names one, exactly as DocuSign does not.

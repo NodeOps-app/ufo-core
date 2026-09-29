@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from uuid import UUID
 
 import httpx
+from pydantic import TypeAdapter
 
 from ufo.sdk.connectors import (
     WORKSPACE_FILE_KEY,
@@ -33,6 +34,7 @@ from ufo_ext_composio import mcp_session
 
 COMPOSIO_API_BASE = "https://backend.composio.dev/api/v3.1"
 COMPOSIO_API_KEY_ENV = "COMPOSIO_API_KEY"
+AUTH_CONFIG_NAMES = TypeAdapter(dict[str, str])
 EXTERNAL_USER_PREFIX = "ufo_"
 COMPOSIO_TIMEOUT_SECONDS = 30.0
 ACTIVE_STATUS = "ACTIVE"
@@ -116,19 +118,20 @@ CUSTOM_AUTH_CONFIGS: dict[str, str] = {
 """Toolkits reached through an auth config an operator created on this deploy's Composio project,
 keyed by slug to that config's name.
 
-Composio holds no managed credentials for these, so the managed route (`POST /auth_configs`) mints
-nothing and the open namespace would refuse the slug. Granola brokers its official MCP server and
-requires the member's own dynamically registered OAuth client, which no broker can mint — the
-operator registered that client with Granola and stored it in the named config, and Composio holds
-and refreshes the tokens from there. Vercel is the same shape reached from the other side: its API
-takes no key at all, and its own MCP server authorizes over OAuth whose registration endpoint
-admits loopback redirect URIs only, so no public deploy can register a client for it — this deploy
-registered a Vercel Integration instead, and the named config holds its credentials. A slug listed
-here therefore rides its named config and never creates one: creating a managed config would bind a
-grant against credentials the provider refuses.
+Granola uses a dynamically registered client, and Vercel uses
+a registered Integration. The named config holds each client's credentials; the consent flow
+selects it explicitly even when the project also holds managed configs for the same toolkit.
 
 Each name must exist on every Composio project a deploy uses — `_named_auth_config` raises where it
 does not, so a config created against one project's key connects there and fails loud elsewhere."""
+
+
+def _custom_auth_config(slug: str) -> str | None:
+    raw = deploy_env("COMPOSIO_AUTH_CONFIGS")
+    configured = AUTH_CONFIG_NAMES.validate_json(raw, strict=True) if raw else {}
+    if any(not key or key != key.lower() or not value.strip() for key, value in configured.items()):
+        raise ValueError("COMPOSIO_AUTH_CONFIGS requires lowercase toolkit keys and nonempty names")
+    return configured.get(slug.lower(), CUSTOM_AUTH_CONFIGS.get(slug.lower()))
 
 
 def connectable(slug: str, toolkit: Mapping[str, object]) -> bool:
@@ -158,7 +161,7 @@ def connectable(slug: str, toolkit: Mapping[str, object]) -> bool:
     tools = meta.get(TOOLS_COUNT_KEY) if isinstance(meta, Mapping) else None
     if not (isinstance(tools, int) and tools > 0):
         return False
-    if slug.lower() in CUSTOM_AUTH_CONFIGS:
+    if _custom_auth_config(slug) is not None:
         return True
     return bool(isinstance(schemes, list) and schemes)
 
@@ -379,8 +382,8 @@ class ComposioClient:
         return ToolRouterSession(id=session_id, url=url)
 
     async def _auth_config(self, toolkit: str) -> str:
-        named = CUSTOM_AUTH_CONFIGS.get(toolkit.lower())
-        if named is not None:
+        named = _custom_auth_config(toolkit)
+        if named:
             return await self._named_auth_config(toolkit, named)
         existing = await self._get("/auth_configs", params={"toolkit_slug": toolkit, "limit": "1"})
         config_id = _auth_config_id(existing)

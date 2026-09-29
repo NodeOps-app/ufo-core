@@ -163,7 +163,9 @@ def _toolkit_record(slug: str) -> dict[str, object]:
 
 
 @pytest.fixture(autouse=True)
-def _reset_connect_flow() -> Iterator[None]:
+def _reset_connect_flow(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    monkeypatch.delenv("COMPOSIO_AUTH_CONFIGS", raising=False)
+    monkeypatch.delenv("UFO_COMPOSIO_AUTH_CONFIGS", raising=False)
     yield
     install_connect_flow(None)
 
@@ -182,7 +184,7 @@ def _composio_handler(
         if method == "POST" and path.endswith("/connected_accounts/link"):
             return httpx.Response(200, json={"redirect_url": COMPOSIO_CONSENT_URL})
         if method == "GET" and path.endswith("/auth_configs"):
-            return httpx.Response(200, json={"items": [{"id": "ac_test"}]})
+            return httpx.Response(200, json={"items": [{"id": "ac_test", "name": "notion-ufo"}]})
         if method == "GET" and "/connected_accounts/" in path:
             payload = {
                 "status": "ACTIVE",
@@ -313,7 +315,7 @@ def test_connectable_requires_managed_credentials_and_tools() -> None:
         ({"composio_managed_auth_schemes": ["OAUTH2"], "meta": {"tools_count": 6.1}}, False),
     )
     for toolkit, expected in cases:
-        assert composio.connectable("notion", toolkit) is expected
+        assert composio.connectable("github", toolkit) is expected
 
 
 def test_connectable_refuses_a_banned_toolkit_however_well_credentialed() -> None:
@@ -340,9 +342,15 @@ async def test_connectable_toolkit_claims_a_slug_an_operator_created_a_config_fo
     assert await _mock_client().connectable_toolkit(CUSTOM_CONFIG_SLUG) == "Granola MCP"
 
 
-async def test_connect_link_rides_the_named_config_of_a_custom_credential_toolkit() -> None:
-    """Granola's consent leg opens the config named in `CUSTOM_AUTH_CONFIGS` — the one holding the
-    member's own OAuth client — and never another config for the toolkit, and never creates one."""
+@pytest.mark.parametrize(
+    "toolkit,config_name",
+    [(CUSTOM_CONFIG_SLUG, CUSTOM_CONFIG_NAME), ("notion", "notion-ufo")],
+)
+async def test_connect_link_rides_the_named_config_of_a_custom_credential_toolkit(
+    toolkit: str, config_name: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if toolkit == "notion":
+        monkeypatch.setenv("COMPOSIO_AUTH_CONFIGS", json.dumps({toolkit: config_name}))
     lookups: list[dict[str, str]] = []
 
     def handle(request: httpx.Request) -> httpx.Response:
@@ -352,8 +360,8 @@ async def test_connect_link_rides_the_named_config_of_a_custom_credential_toolki
                 200,
                 json={
                     "items": [
-                        {"id": "ac_stale", "name": "granola_mcp-old"},
-                        {"id": CUSTOM_CONFIG_ID, "name": CUSTOM_CONFIG_NAME},
+                        {"id": "ac_stale", "name": f"{toolkit}-managed"},
+                        {"id": CUSTOM_CONFIG_ID, "name": config_name},
                     ]
                 },
             )
@@ -364,12 +372,74 @@ async def test_connect_link_rides_the_named_config_of_a_custom_credential_toolki
 
     client = composio.ComposioClient(api_key="test", transport=httpx.MockTransport(handle))
     redirect = await client.connect_link(
-        toolkit=CUSTOM_CONFIG_SLUG, user_id="ufo_ws", callback_url="https://ufo.example.com/back"
+        toolkit=toolkit, user_id="ufo_ws", callback_url="https://ufo.example.com/back"
     )
     assert redirect == COMPOSIO_CONSENT_URL
-    assert lookups == [
-        {"toolkit_slug": CUSTOM_CONFIG_SLUG, "limit": str(composio.AUTH_CONFIG_PAGE_LIMIT)}
-    ]
+    assert lookups == [{"toolkit_slug": toolkit, "limit": str(composio.AUTH_CONFIG_PAGE_LIMIT)}]
+
+
+@pytest.mark.parametrize("toolkit", ["notion", "zoom"])
+@pytest.mark.parametrize("setting", [None, "", "custom", "scoped"])
+async def test_configured_auth_is_opt_in(
+    toolkit: str, setting: str | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if setting is not None:
+        monkeypatch.setenv(
+            "COMPOSIO_AUTH_CONFIGS", json.dumps({toolkit: "company-app"}) if setting else ""
+        )
+    if setting == "scoped":
+        monkeypatch.setenv("COMPOSIO_AUTH_CONFIGS", json.dumps({toolkit: "wrong-app"}))
+        monkeypatch.setenv("UFO_COMPOSIO_AUTH_CONFIGS", json.dumps({toolkit: "company-app"}))
+    expected_id = "ac_custom" if setting else "ac_managed"
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path.endswith("/auth_configs"):
+            assert request.url.params["limit"] == (
+                str(composio.AUTH_CONFIG_PAGE_LIMIT) if setting else "1"
+            )
+            return httpx.Response(
+                200,
+                json={
+                    "items": [
+                        {"id": "ac_managed", "name": "notion-managed"},
+                        {"id": "ac_custom", "name": "company-app"},
+                    ]
+                },
+            )
+        if request.method == "POST" and request.url.path.endswith("/connected_accounts/link"):
+            assert json.loads(request.content)["auth_config_id"] == expected_id
+            return httpx.Response(200, json={"redirect_url": COMPOSIO_CONSENT_URL})
+        raise AssertionError(f"unexpected request {request.method} {request.url}")
+
+    client = composio.ComposioClient(api_key="test", transport=httpx.MockTransport(handle))
+    assert (
+        await client.connect_link(
+            toolkit=toolkit, user_id="ufo_ws", callback_url="https://ufo.example.com/back"
+        )
+        == COMPOSIO_CONSENT_URL
+    )
+
+
+@pytest.mark.parametrize(
+    "value", ["invalid", "[]", '{"notion": 1}', '{"notion": " "}', '{"Notion": "app"}']
+)
+async def test_invalid_auth_config_settings_fail_before_connecting(
+    value: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("COMPOSIO_AUTH_CONFIGS", value)
+    with pytest.raises(ValueError):
+        await _mock_client().connect_link(
+            toolkit="notion", user_id="ufo_ws", callback_url="https://ufo.example.com/back"
+        )
+
+
+def test_configured_auth_makes_an_unmanaged_toolkit_connectable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("COMPOSIO_AUTH_CONFIGS", '{"notion": "company-app"}')
+    assert composio.connectable(
+        "notion", {"composio_managed_auth_schemes": [], "meta": {"tools_count": 1}}
+    )
 
 
 async def test_named_config_lookup_pages_within_composios_limit() -> None:
