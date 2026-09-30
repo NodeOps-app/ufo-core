@@ -114,6 +114,34 @@ def test_exec_reports_launch_failure(linux_guest: LinuxGuest, argv: list[str], c
     linux_guest.request("cleanup", path=stage)
 
 
+def test_prepare_restores_writable_paths_from_root_owned_template(linux_guest: LinuxGuest) -> None:
+    linux_guest.command(
+        "import os,pathlib; "
+        "pathlib.Path('/home/user/.ufo').mkdir(exist_ok=True); "
+        "pathlib.Path('/home/user/.ufo/session').write_text('retained'); "
+        "os.chown('/home/user/.ufo/session',0,0); "
+        "os.chmod('/home/user/.ufo/session',0o600); os.chown('/workspace',0,0)"
+    )
+    assert "error" not in linux_guest.request("prepare", conversation_id=str(uuid4()))
+    stage = linux_guest.request("stage")["path"]
+    result = linux_guest.request(
+        "exec",
+        path=stage,
+        exec_id=uuid4().hex,
+        argv=[
+            "python3",
+            "-c",
+            "from pathlib import Path; "
+            "Path('/workspace/ownership-probe').write_text('ok'); "
+            "p=Path('/home/user/.ufo/session'); assert p.read_text()=='retained'; "
+            "p.write_text('updated')",
+        ],
+        env={"PATH": "/usr/local/bin:/usr/bin:/bin"},
+    )
+    assert result["exit_code"] == 0
+    assert linux_guest.request("cleanup", path=stage) == {}
+
+
 def test_exec_isolates_identity_environment_and_large_output(linux_guest: LinuxGuest) -> None:
     stage = linux_guest.request("stage")["path"]
     result = linux_guest.request(

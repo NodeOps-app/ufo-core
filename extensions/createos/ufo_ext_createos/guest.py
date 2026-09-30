@@ -101,6 +101,27 @@ class Guest:
             raise FileNotFoundError(errno.ENOENT, "sandbox image requires /usr/local/bin/ufo")
         for path in (HOME_ROOT, HOME_ROOT / ".ufo", HOME_ROOT / ".ufo/runs"):
             self._root_directory(path, 0o755)
+        workspace = Path("/workspace")
+        metadata = workspace.lstat()
+        if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid not in (0, USER_ID):
+            raise PermissionError(errno.EPERM, "unsafe workspace directory")
+        os.chown(workspace, USER_ID, GROUP_ID)
+        session = HOME_ROOT / ".ufo/session"
+        try:
+            descriptor = os.open(session, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            pass
+        else:
+            os.close(descriptor)
+        metadata = session.lstat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid not in (0, USER_ID)
+            or metadata.st_nlink != 1
+        ):
+            raise PermissionError(errno.EPERM, "unsafe session file")
+        os.chown(session, USER_ID, GROUP_ID)
+        session.chmod(0o600)
         runtime = HOME_ROOT / ".ufo/runs" / UUID(self.request.conversation_id).hex
         try:
             runtime.mkdir(mode=0o700)
