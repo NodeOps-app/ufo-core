@@ -125,7 +125,10 @@ async def test_live_createos_carrier() -> None:
         attached = await second.attach(replace(spec, resume_id=handle.container_id, turn_id=None))
         assert attached is not None and not attached.egress_env
         assert b"".join([chunk async for chunk in second.read(attached, path)]) == content
-        assert await second.file_op(attached, "read", {"path": "/workspace/hello.txt"})
+        attached_session = SandboxSession(carrier=second, handle=attached)
+        assert "hello createos" in str(
+            await attached_session.run_ufo_fs("read", {"path": "/workspace/hello.txt"})
+        )
         resumed = await second.create(
             replace(
                 spec,
@@ -175,8 +178,12 @@ async def test_live_createos_carrier() -> None:
             await asyncio.gather(first, other, return_exceptions=True)
         await second._request("DELETE", second._path(handle.container_id))
         assert await second.attach(replace(spec, resume_id=handle.container_id)) is None
-        with pytest.raises(SandboxUnreachable):
-            await second.create(replace(spec, resume_id=handle.container_id))
+        replacement = await second.create(replace(spec, resume_id=handle.container_id))
+        assert replacement.container_id != handle.container_id
+        recovered = await second.create(replace(spec, resume_id=handle.container_id))
+        assert recovered.container_id == replacement.container_id
+        with pytest.raises(FileNotFoundError):
+            _ = [chunk async for chunk in second.read(replacement, path)]
     finally:
         await carrier.aclose()
         await second.aclose()

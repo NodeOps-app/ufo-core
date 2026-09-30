@@ -479,7 +479,9 @@ containing only the public egress proxy's IPv4 addresses and port, and authentic
 bound to host loopback for inbound services. Public sandbox ingress stays disabled. Commands and
 file access run as uid/gid 1000; CA installation and trusted skill setup run as root. Each exec
 receives its own run-token environment. The stored `createos:<id>` handle and full conversation
-ownership marker govern reattachment; a missing stored sandbox cannot become an empty workspace.
+ownership marker govern reattachment. Opening a deleted or expired sandbox recovers a replacement
+by conversation name or creates one from the template; the conversation stores its new handle.
+Deleted workspace files are not restored, and read-only attachment never provisions a replacement.
 Provider idle pause preserves the workspace, and opening it resumes it. The carrier's guest
 supervisor enforces command deadlines and turn-scoped cancellation.
 

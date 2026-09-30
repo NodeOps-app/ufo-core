@@ -118,15 +118,13 @@ async def test_attach_paginates_skips_destroyed_names_and_carries_no_credentials
     assert handle.run_token is None and not handle.egress_env
 
 
-async def test_stored_missing_sandbox_never_becomes_a_new_workspace() -> None:
+async def test_read_only_attach_does_not_replace_a_missing_sandbox() -> None:
     request = replace(spec(), resume_id="sb-missing")
     carrier = CreateOSCarrier(
         api_key="test-key",
         _transport=httpx.MockTransport(lambda _: httpx.Response(404)),
     )
     assert await carrier.attach(request) is None
-    with pytest.raises(SandboxUnreachable, match="no longer exists"):
-        await carrier.create(request)
 
 
 async def test_readiness_resumes_paused_sandbox_and_handles_concurrent_resume() -> None:
@@ -141,6 +139,69 @@ async def test_readiness_resumes_paused_sandbox_and_handles_concurrent_resume() 
 
     carrier = CreateOSCarrier(api_key="test-key", _transport=httpx.MockTransport(response))
     assert (await carrier._ready("sb-test")).status == "running"
+
+
+@pytest.mark.parametrize("old_status", [None, "destroying", "destroyed", "failed"])
+@pytest.mark.parametrize("recovery", ["create", "existing", "conflict"])
+async def test_expired_handle_recovers_one_conversation_sandbox(
+    old_status: str | None, recovery: str
+) -> None:
+    request = replace(
+        spec(),
+        resume_id="sb-expired",
+        proxy=ProxyEndpoint(port=443, ca_cert="ca", public_url="https://1.1.1.1"),
+    )
+    owned = {
+        "id": "sb-replacement",
+        "name": sandbox_name(request.conversation_id),
+        "status": "running",
+        "envs": [owner_key(request.conversation_id)],
+    }
+    available = recovery == "existing"
+    creates = 0
+    old_reads = 0
+
+    def response(call: httpx.Request) -> httpx.Response:
+        nonlocal available, creates, old_reads
+        match call.method, call.url.path:
+            case "GET", "/v1/sandboxes/sb-expired":
+                old_reads += 1
+                if old_status is None:
+                    return httpx.Response(404)
+                state = "destroyed" if old_status == "destroying" and old_reads > 1 else old_status
+                data = {**owned, "id": "sb-expired", "status": state}
+            case "GET", "/v1/sandboxes":
+                page = [owned] if available else []
+                data = {"data": page, "pagination": {"total": len(page)}}
+            case "POST", "/v1/sandboxes":
+                creates += 1
+                available = True
+                assert json.loads(call.content)["name"] == owned["name"]
+                if recovery == "conflict":
+                    return httpx.Response(409)
+                data = owned
+            case "POST", "/v1/sandboxes/sb-replacement/exec":
+                data = {"result": {"stdout": "{}", "stderr": "", "exit_code": 0}}
+            case _:
+                assert call.url.path.startswith("/v1/sandboxes/sb-replacement")
+                data = owned
+        return httpx.Response(200, json={"status": "success", "data": data})
+
+    carrier = CreateOSCarrier(api_key="test-key", _transport=httpx.MockTransport(response))
+    first = await carrier.create(request)
+    recovered = await carrier.create(request)
+    persisted = await carrier.create(replace(request, resume_id=first.container_id))
+    assert first.container_id == recovered.container_id == persisted.container_id == owned["id"]
+    assert creates == (0 if recovery == "existing" else 1)
+
+
+@pytest.mark.parametrize("status", [401, 403, 500])
+async def test_provider_failure_does_not_replace_saved_sandbox(status: int) -> None:
+    carrier = CreateOSCarrier(
+        api_key="test-key", _transport=httpx.MockTransport(lambda _: httpx.Response(status))
+    )
+    with pytest.raises(RuntimeError, match=f"HTTP {status}"):
+        await carrier.create(replace(spec(), resume_id="sb-owned"))
 
 
 async def test_provider_errors_do_not_expose_response_or_api_key() -> None:

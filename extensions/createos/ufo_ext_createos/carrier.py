@@ -6,7 +6,7 @@ import ipaddress
 import json
 import socket
 from collections.abc import AsyncIterator, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import cached_property
 from pathlib import Path
 from typing import Literal
@@ -172,8 +172,15 @@ class CreateOSCarrier:
     async def create(self, spec: SandboxSpec) -> SandboxHandle:
         """Open the conversation's sandbox and refresh its proxy policy and trust roots."""
         sandbox = await self._find(spec)
-        if sandbox is None and spec.resume_id:
-            raise SandboxUnreachable(f"CreateOS sandbox {spec.resume_id} no longer exists")
+        if sandbox is not None:
+            self._check_owner(sandbox, spec.conversation_id)
+        if sandbox is not None and sandbox.status == "destroying":
+            async with asyncio.timeout(LIFECYCLE_TIMEOUT_SECONDS):
+                while sandbox is not None and sandbox.status == "destroying":
+                    await asyncio.sleep(STATE_POLL_SECONDS)
+                    sandbox = await self._get(sandbox.id)
+        if spec.resume_id and (sandbox is None or sandbox.status in TERMINAL_STATES):
+            sandbox = await self._find(replace(spec, resume_id=None))
         proxy = urlsplit(spec.proxy.public_url or "")
         env = {**GUEST_ENV, **egress_proxy_env(spec.proxy, spec.run_token), **spec.env}
         host = proxy.hostname
@@ -207,7 +214,7 @@ class CreateOSCarrier:
             except ProviderError as error:
                 if error.status != 409:
                     raise
-                sandbox = await self._find(spec)
+                sandbox = await self._find(replace(spec, resume_id=None))
             if sandbox is None:
                 raise SandboxUnreachable("CreateOS did not return the conversation sandbox")
         self._check_owner(sandbox, spec.conversation_id)

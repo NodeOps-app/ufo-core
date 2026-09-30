@@ -6,10 +6,11 @@ calls directly; the synchronous CreateOS Python SDK is not required. The API key
 ## Prepare a template
 
 Build a Linux `ufo` client from this checkout, publish it at an HTTPS URL accessible to the template
-builder, and record its SHA-256 digest. On Linux:
+builder, and record its SHA-256 digest. On Linux amd64 with Go 1.27.0 and Rust installed:
 
 ```bash
-cargo build --locked --release --manifest-path client/Cargo.toml
+client/scripts/build-gh.sh x86_64-unknown-linux-musl /tmp/ufo-gh.gz
+UFO_GH_ARCHIVE=/tmp/ufo-gh.gz cargo build --locked --release --manifest-path client/Cargo.toml
 sha256sum client/target/release/ufo
 ```
 
@@ -55,8 +56,11 @@ installation run as root. Each command receives its own environment, including i
 proxy token. Interactive PTY attachment is not provided by this carrier.
 
 Sandboxes idle for 30 minutes pause; reopening resumes them. Files survive pause and server
-restart. Deleting a sandbox deletes its workspace, and a stored missing handle raises instead
-of creating an empty replacement. Use CreateOS's operator tools to manage or delete sandboxes.
+restart. When a saved sandbox is deleted or expires, the next execution opens a replacement from
+the configured template and persists its new ID. Recovery reuses an existing conversation-named
+replacement before creating one, including after a concurrent create conflict. Deleted workspace
+files are not restored. Read-only attachment never provisions a replacement. Use CreateOS's
+operator tools to manage or delete sandboxes.
 
 ## Validate
 
