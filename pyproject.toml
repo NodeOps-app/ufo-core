@@ -56,6 +56,7 @@ composio = "ufo_ext_composio.manifest:manifest"
 connectors = "ufo_ext_connectors.manifest:manifest"
 context_compact = "ufo_ext_context_compact.manifest:manifest"
 context_rollover = "ufo_ext_context_rollover.manifest:manifest"
+createos = "ufo_ext_createos.carrier:manifest"
 debugger = "ufo_ext_debugger.manifest:manifest"
 docker = "ufo_ext_docker:manifest"
 documents = "ufo_ext_documents.manifest:manifest"
@@ -127,6 +128,7 @@ packages = [
     "extensions/connectors/ufo_ext_connectors",
     "extensions/context_compact/ufo_ext_context_compact",
     "extensions/context_rollover/ufo_ext_context_rollover",
+    "extensions/createos/ufo_ext_createos",
     "extensions/debugger/ufo_ext_debugger",
     "extensions/documents/ufo_ext_documents",
     "extensions/gbrain/ufo_ext_gbrain",

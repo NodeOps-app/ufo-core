@@ -40,6 +40,7 @@ EXTENSIONS = (
     "browser_use",
     "skill_create",
     "context_compact",
+    "createos",
     "index_default",
     "embed_openai",
     "flags_open",

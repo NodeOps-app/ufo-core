@@ -473,8 +473,19 @@ state commits on the failure path too.
 
 ## Sandboxing
 
-Every turn executes tools in a sandbox: Docker container from a pinned image (baked toolchain),
-default-deny network egress with exactly one route out — the sandbox proxy. A sandbox belongs to a
+The `createos` carrier extension provisions one persistent sandbox per conversation from an
+immutable `tpl_` template. It uses asynchronous HTTPS control calls, a provider-enforced allowlist
+containing only the public egress proxy's IPv4 addresses and port, and authenticated TCP tunnels
+bound to host loopback for inbound services. Public sandbox ingress stays disabled. Commands and
+file access run as uid/gid 1000; CA installation and trusted skill setup run as root. Each exec
+receives its own run-token environment. The stored `createos:<id>` handle and full conversation
+ownership marker govern reattachment; a missing stored sandbox cannot become an empty workspace.
+Provider idle pause preserves the workspace, and opening it resumes it. The carrier's guest
+supervisor enforces command deadlines and turn-scoped cancellation.
+
+Server-hosted turns execute tools in a sandbox with a baked toolchain and default-deny network
+egress with exactly one route out — the sandbox proxy. Docker uses a pinned image; remote carrier
+extensions supply the same boundary through their providers. A sandbox belongs to a
 conversation, and a subagent turn executes in the sandbox of the turn that spawned it — one
 filesystem for a whole spawn tree, so a file a child leaves in `/workspace` is the handoff back to
 its parent, and co-residency is the cost: session state at fixed paths, one serving port, one

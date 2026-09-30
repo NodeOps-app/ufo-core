@@ -75,6 +75,9 @@ agent reads and edits files and runs commands when you start a conversation:
 A resumed conversation keeps the execution location it already has. See `client/README.md` for
 client options.
 
+[CreateOS](extensions/createos/README.md) provides persistent remote sandboxes through the
+`createos` carrier. It uses a prepared template, private port tunnels, and ufo's public egress proxy.
+
 `.env` refuses the bare names `ANTHROPIC_API_KEY` and `OPENAI_API_KEY`, because every tool that
 reads `.env` gets all of its values.
 
