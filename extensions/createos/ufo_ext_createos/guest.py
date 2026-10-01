@@ -48,7 +48,6 @@ class GuestResult(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     path: str = ""
-    runtime_root: str = ""
     stdout_path: str = ""
     stderr_path: str = ""
     exit_code: int = 0
@@ -61,7 +60,7 @@ class GuestResult(BaseModel):
 class Guest:
     request: Request
 
-    def run(self) -> dict[str, str | int | None]:
+    def run(self) -> GuestResult:
         """Execute one trusted host request inside the sandbox."""
         if os.geteuid() != 0:
             raise PermissionError(errno.EPERM, "carrier requires root")
@@ -75,7 +74,7 @@ class Guest:
                 self._root_directory(STAGE_ROOT, 0o700)
                 path = STAGE_ROOT / uuid4().hex
                 path.mkdir(mode=0o700)
-                return {"path": str(path)}
+                return GuestResult(path=str(path))
             case "exec":
                 stage = self._stage(self.request.path)
                 try:
@@ -96,21 +95,23 @@ class Guest:
                             shutil.rmtree(stage)
             case "stop":
                 self._stop()
-            case "write":
-                self._write()
-            case "read":
-                self._read()
+            case "write" | "read":
+                with (STAGE_ROOT / "prepare.lock").open("a") as lock:
+                    fcntl.flock(lock, fcntl.LOCK_EX)
+                    self._check_turn()
+                    if self.request.action == "write":
+                        self._write()
+                    else:
+                        self._read()
             case "cleanup":
                 with (STAGE_ROOT / "prepare.lock").open("a") as lock:
                     fcntl.flock(lock, fcntl.LOCK_EX)
                     stage = self._stage(self.request.path, missing_ok=True)
                     if stage.exists():
                         shutil.rmtree(stage)
-            case _:
-                raise ValueError("unknown guest action")
-        return {}
+        return GuestResult()
 
-    def _prepare(self) -> dict[str, str | int | None]:
+    def _prepare(self) -> GuestResult:
         user = pwd.getpwuid(USER_ID)
         if user.pw_gid != GROUP_ID or user.pw_dir != str(HOME_ROOT):
             raise ValueError("sandbox user must have uid/gid 1000 and /home/user home")
@@ -159,7 +160,7 @@ class Guest:
         ]
         entries.extend(line + " # ufo-egress" for line in self.request.hosts.splitlines() if line)
         hosts.write_text("\n".join(entries) + "\n")
-        return {"runtime_root": str(runtime)}
+        return GuestResult()
 
     def _root_directory(self, path: Path, mode: int) -> None:
         try:
@@ -185,10 +186,10 @@ class Guest:
             raise PermissionError(errno.EPERM, "unsafe stage directory")
         return path
 
-    def _exec(self) -> dict[str, str | int | None]:
+    def _exec(self) -> GuestResult:
         stage = self._stage(self.request.path)
-        if not self.request.exec_id or self.request.timeout_s <= 0:
-            raise ValueError("exec requires an identifier and a positive timeout")
+        if not self.request.exec_id:
+            raise ValueError("exec requires an identifier")
         stdout_path = stage / "stdout"
         stderr_path = stage / "stderr"
         timed_out: int | None = None
@@ -200,8 +201,7 @@ class Guest:
                 self._root_directory(CGROUP_ROOT, 0o700)
                 self._prune_groups()
                 turn = CGROUP_ROOT / hashlib.sha256(self.request.turn_id.encode()).hexdigest()
-                if self.request.turn_id and (STOPPED_ROOT / turn.name).exists():
-                    raise OSError(errno.ECANCELED, "turn has been stopped")
+                self._check_turn()
                 self._root_directory(turn, 0o700)
                 group = turn / UUID(self.request.exec_id).hex
                 group.mkdir(mode=0o700)
@@ -234,13 +234,13 @@ class Guest:
             with (STAGE_ROOT / "prepare.lock").open("a") as lock:
                 fcntl.flock(lock, fcntl.LOCK_EX)
                 self._prune_groups()
-        return {
-            "path": str(stage),
-            "stdout_path": str(stdout_path),
-            "stderr_path": str(stderr_path),
-            "exit_code": exit_code,
-            "timed_out_after_s": timed_out,
-        }
+        return GuestResult(
+            path=str(stage),
+            stdout_path=str(stdout_path),
+            stderr_path=str(stderr_path),
+            exit_code=exit_code,
+            timed_out_after_s=timed_out,
+        )
 
     def _enter_group(self, group: Path) -> None:
         (group / "cgroup.procs").write_text(str(os.getpid()))
@@ -274,6 +274,12 @@ class Guest:
             if turn.exists():
                 (turn / "cgroup.kill").write_text("1")
             self._prune_groups()
+
+    def _check_turn(self) -> None:
+        if self.request.turn_id:
+            marker = STOPPED_ROOT / hashlib.sha256(self.request.turn_id.encode()).hexdigest()
+            if marker.exists():
+                raise OSError(errno.ECANCELED, "turn has been stopped")
 
     def _write(self) -> None:
         source = Path(self.request.input_path)
@@ -312,9 +318,9 @@ class Guest:
 if __name__ == "__main__":
     try:
         print(
-            GuestResult.model_validate(
-                Guest(Request.model_validate_json(sys.stdin.read())).run()
-            ).model_dump_json(exclude_unset=True)
+            Guest(Request.model_validate_json(sys.stdin.read()))
+            .run()
+            .model_dump_json(exclude_unset=True)
         )
     except OSError as error:
         print(GuestResult(error=str(error), errno=error.errno).model_dump_json(exclude_unset=True))

@@ -70,7 +70,7 @@ agent reads and edits files and runs commands when you start a conversation:
 | File reads, edits, and commands | The connected client runs them on your machine as your user. | They run in the workspace's configured sandbox. |
 | Working files | Your current directory when you start `ufo`. | The sandbox's `/workspace`, separate from your current directory. |
 | Client connection | Keep `ufo` running until the turn ends; those steps need that connection. | The turn can continue after `ufo` exits. Use `--wait SECONDS` to leave early and `--resume ID` to read the rest. |
-| Execution boundary | Your machine and your user account. | The configured sandbox carrier: `local` on the server by default, or a carrier such as Docker or E2B. |
+| Execution boundary | Your machine and your user account. | The configured sandbox carrier: `local` on the server by default, or a carrier such as Docker, E2B, or CreateOS. |
 
 A resumed conversation keeps the execution location it already has. See `client/README.md` for
 client options.

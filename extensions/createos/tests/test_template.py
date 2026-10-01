@@ -1,15 +1,19 @@
 import json
 import shlex
+import tomllib
+from pathlib import Path
 
 import httpx
 import pytest
 from pydantic import ValidationError
 
 from sandbox.build_createos_template import (
+    GUEST_PACKAGES,
     MAX_DOCKERFILE_BYTES,
     TemplatePublisher,
     TemplateResponse,
     TemplateSource,
+    guest_requirements,
 )
 
 CLIENT_URL = "https://downloads.example.com/ufo-linux"
@@ -44,7 +48,7 @@ def test_template_keeps_runtime_ancestors_root_owned_and_workspace_writable() ->
     assert "-o root -g root -m 0700 /var/lib/ufo-carrier" in dockerfile
     assert "-o 1000 -g 1000 -m 0600 /dev/null /home/user/.ufo/session" in dockerfile
     assert "apt-get purge -y sudo" in dockerfile
-    assert "/opt/ufo-carrier/bin/pip install --no-cache-dir pydantic==" in dockerfile
+    assert "/opt/ufo-carrier/bin/pip install --no-cache-dir --require-hashes" in dockerfile
     assert "wrong CPU architecture" in dockerfile
     assert "/usr/local/bin/ufo --version" in dockerfile
 
@@ -201,3 +205,16 @@ def test_publish_rejects_oversized_utf8_dockerfile_before_sending() -> None:
         pytest.raises(ValueError, match="exceeds 64 KiB"),
     ):
         TemplatePublisher(client).publish(source)
+
+
+def test_guest_requirements_pin_every_dependency_and_hash_from_uv_lock() -> None:
+    lock = tomllib.loads(Path("uv.lock").read_text())
+    packages = {p["name"]: p for p in lock["package"] if p["name"] in GUEST_PACKAGES}
+    requirements = guest_requirements().splitlines()
+    assert len(requirements) == len(GUEST_PACKAGES)
+    for line in requirements:
+        pinned, *hashes = line.split()
+        name, version = pinned.split("==")
+        assert version == packages[name]["version"]
+        assert set(hashes) == {"--hash=" + wheel["hash"] for wheel in packages[name]["wheels"]}
+        assert {dep["name"] for dep in packages[name].get("dependencies", [])} <= packages.keys()

@@ -14,7 +14,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 from ufo_ext_createos.carrier import CreateOSCarrier
 
-from ufo.sdk.sandbox import ProxyEndpoint, SandboxSession, SandboxSpec, SandboxUnreachable
+from ufo.sdk.sandbox import ProxyEndpoint, SandboxSession, SandboxSpec
 
 TEMPLATE = os.environ.get("UFO_CREATEOS_TEST_TEMPLATE")
 pytestmark = [
@@ -141,10 +141,12 @@ async def test_live_createos_carrier() -> None:
         assert resumed.container_id == handle.container_id
         result = await second.exec(resumed, ("sh", "-c", 'echo "$TEST_VALUE:$HTTPS_PROXY"'), 10)
         assert result.stdout.startswith("second:https://second-turn:")
-        with pytest.raises(SandboxUnreachable):
+        assert (
             await second.attach(
                 replace(spec, conversation_id=uuid4(), resume_id=handle.container_id)
             )
+            is None
+        )
         sibling = replace(resumed, turn_id=uuid4())
         waiting = (
             "import pathlib,sys,time; pathlib.Path(sys.argv[1]).touch(); "
@@ -175,12 +177,29 @@ async def test_live_createos_carrier() -> None:
             with pytest.raises(OSError, match="turn has been stopped"):
                 await second.exec(resumed, ("touch", "/workspace/late-command"), 10)
             with pytest.raises(FileNotFoundError):
-                _ = [chunk async for chunk in second.read(resumed, "/workspace/late-command")]
+                _ = [
+                    chunk
+                    async for chunk in second.read(
+                        replace(resumed, turn_id=None), "/workspace/late-command"
+                    )
+                ]
             await second.write(sibling, "/workspace/release", b"")
             assert (await asyncio.wait_for(other, 15)).exit_code == 0
         finally:
             await second.stop_commands(sibling)
             await asyncio.gather(first, other, return_exceptions=True)
+        paused_turn = replace(resumed, turn_id=uuid4())
+        await second._request("POST", second._path(handle.container_id, "/pause"))
+        await second.stop_commands(paused_turn)
+        with pytest.raises(OSError, match="turn has been stopped"):
+            await second.exec(paused_turn, ("touch", "/workspace/paused-late-command"), 10)
+        with pytest.raises(FileNotFoundError):
+            _ = [
+                chunk
+                async for chunk in second.read(
+                    replace(resumed, turn_id=None), "/workspace/paused-late-command"
+                )
+            ]
         await second._request("DELETE", second._path(handle.container_id))
         assert await second.attach(replace(spec, resume_id=handle.container_id)) is None
         replacement = await second.create(replace(spec, resume_id=handle.container_id))

@@ -478,21 +478,25 @@ immutable `tpl_` template. It uses asynchronous HTTPS control calls, a provider-
 containing only the public egress proxy's IPv4 addresses and port, and authenticated TCP tunnels
 bound to host loopback for inbound services. Public sandbox ingress stays disabled. Commands and
 file access run as uid/gid 1000; CA installation and trusted skill setup run as root. The skills
-namespace is root-owned and not member-writable; host and guest share validated message models. Each exec
-receives its own run-token environment. The stored `createos:<id>` handle and full conversation
-ownership marker govern reattachment. Opening a deleted or expired sandbox recovers a replacement
-by conversation name or creates one from the template; the conversation stores its new handle.
+namespace is root-owned and not member-writable; host and guest share validated message models.
+Each exec receives its own run-token environment. The stored `createos:<id>` handle and full
+conversation ownership marker govern reattachment. Opening a deleted or expired sandbox recovers
+a replacement by conversation name or creates one from the template; the conversation stores its
+new handle.
 Deleted workspace files are not restored, and read-only attachment never provisions a replacement.
 Provider idle pause preserves the workspace, and opening it resumes it. The carrier's guest
 supervisor enforces command deadlines and turn-scoped cancellation. Stop records cancellation on
-protected disk under the launch lock; subsequent execs for that turn are refused even after its
-cgroup is removed.
+protected disk under the launch lock; subsequent execs and file operations carrying that turn ID
+are refused even after its cgroup is removed. Stop resumes a paused sandbox before recording the
+cancellation. Each stdout/stderr download is bounded to 16 MiB; overflow fails the command result.
 
-Every turn executes tools through its bound sandbox carrier. Container and remote VM carriers
-provide a baked toolchain and default-deny network egress through the sandbox proxy. Docker uses a
-pinned image; remote carrier extensions supply that boundary through their providers. A sandbox belongs to a
-conversation, and a subagent turn executes in the sandbox of the turn that spawned it — one
-filesystem for a whole spawn tree, so a file a child leaves in `/workspace` is the handoff back to
+Every turn executes tools in a sandbox through its bound carrier. Container and remote VM carriers
+provide a baked toolchain and default-deny network egress with exactly one route out: the sandbox
+proxy. The local and client carriers have the trusted-input boundaries described above. Docker
+uses a pinned image; remote carrier extensions supply the network boundary through their providers.
+A sandbox belongs to a conversation, and a subagent turn executes in the sandbox of the turn that
+spawned it — one filesystem for a whole spawn tree, so a file a child leaves in `/workspace` is
+the handoff back to
 its parent, and co-residency is the cost: session state at fixed paths, one serving port, one
 `/proc` carrying the run token.
 The sandbox is late-bound: the first operation that needs one creates it — a command, a file op, a

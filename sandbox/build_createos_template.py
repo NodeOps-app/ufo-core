@@ -2,7 +2,9 @@
 
 import argparse
 import shlex
+import tomllib
 from dataclasses import dataclass
+from pathlib import Path
 from time import monotonic, sleep
 from typing import Literal
 from urllib.parse import urlsplit
@@ -17,7 +19,45 @@ BUILD_TIMEOUT_SECONDS = 1800
 POLL_SECONDS = 5
 REQUEST_TIMEOUT_SECONDS = 30
 MAX_DOCKERFILE_BYTES = 64 * 1024
-PYDANTIC_VERSION = "2.13.4"
+GUEST_PACKAGES = frozenset(
+    {"pydantic", "pydantic-core", "annotated-types", "typing-extensions", "typing-inspection"}
+)
+
+
+class LockedDependency(BaseModel):
+    name: str
+
+
+class LockedWheel(BaseModel):
+    hash: str
+
+
+class LockedPackage(BaseModel):
+    name: str
+    version: str
+    dependencies: list[LockedDependency] = []
+    wheels: list[LockedWheel] = []
+
+
+class Lockfile(BaseModel):
+    package: list[LockedPackage]
+
+
+def guest_requirements() -> str:
+    """Read exact guest dependency versions and wheel hashes from the project's lockfile."""
+    lock = Lockfile.model_validate(
+        tomllib.loads(Path(__file__).parents[1].joinpath("uv.lock").read_text())
+    )
+    packages = {package.name: package for package in lock.package if package.name in GUEST_PACKAGES}
+    if packages.keys() != GUEST_PACKAGES:
+        raise ValueError("guest dependencies are missing from uv.lock")
+    lines = []
+    for name, package in sorted(packages.items()):
+        if not package.wheels or any(dep.name not in packages for dep in package.dependencies):
+            raise ValueError(f"guest dependency {name} is not fully locked")
+        hashes = " ".join(f"--hash={wheel.hash}" for wheel in package.wheels)
+        lines.append(f"{name}=={package.version} {hashes}")
+    return "\n".join(lines) + "\n"
 
 
 class TemplateSource(BaseModel):
@@ -51,8 +91,10 @@ class TemplateSource(BaseModel):
                 "python3 python3-venv curl ca-certificates git jq ripgrep util-linux "
                 "&& apt-get purge -y sudo && rm -rf /etc/sudoers /etc/sudoers.d "
                 "/var/lib/apt/lists/*",
-                "RUN python3 -m venv /opt/ufo-carrier && "
-                f"/opt/ufo-carrier/bin/pip install --no-cache-dir pydantic=={PYDANTIC_VERSION}",
+                "RUN python3 -m venv /opt/ufo-carrier && printf '%b' "
+                + shlex.quote(guest_requirements().replace("\n", "\\n"))
+                + " | /opt/ufo-carrier/bin/pip install --no-cache-dir --require-hashes "
+                "--only-binary=:all: -r /dev/stdin",
                 "RUN curl --fail --silent --show-error --location --proto '=https' "
                 "--proto-redir '=https' "
                 f"{shlex.quote(self.client_url)} -o /usr/local/bin/ufo "

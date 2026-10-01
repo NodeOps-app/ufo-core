@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import ipaddress
 import json
+import logging
 import socket
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, field, replace
@@ -17,10 +18,8 @@ import httpx
 from pydantic import BaseModel, Field
 
 from ufo.sdk.credentials import deploy_env
-from ufo.sdk.manifest import Manifest
 from ufo.sdk.sandbox import (
     SANDBOX_ENV,
-    CarrierSpec,
     DialTarget,
     ExecResult,
     SandboxHandle,
@@ -34,6 +33,8 @@ from ufo.sdk.sandbox import (
 from ufo_ext_createos.guest import GuestResult, Request
 from ufo_ext_createos.tunnel import CreateOSTunnels
 
+logger = logging.getLogger(__name__)
+
 NAME = "createos"
 API_KEY_ENV = "CREATEOS_API_KEY"
 API_URL = "https://api.sb.createos.sh"
@@ -44,6 +45,7 @@ STATE_POLL_SECONDS = 1
 IDLE_TIMEOUT_SECONDS = 1800
 READ_CHUNK_BYTES = 1024 * 1024
 MAX_REQUEST_BYTES = 256 * 1024
+MAX_OUTPUT_BYTES = 16 * 1024 * 1024
 MAX_FILE_BYTES = 10 * 1024 * 1024 * 1024
 PAGE_SIZE = 500
 NAME_DIGEST_CHARS = 18
@@ -178,6 +180,13 @@ class CreateOSCarrier:
         self._check_owner(sandbox, spec.conversation_id)
         await self._ready(sandbox.id)
         await self._configure(sandbox, spec, rules, "\n".join(f"{ip} {host}" for ip in ips))
+        if spec.resume_id and spec.resume_id != sandbox.id:
+            logger.warning(
+                "CreateOS workspace %s replaced sandbox %s with %s; deleted files are unavailable",
+                spec.conversation_id,
+                spec.resume_id,
+                sandbox.id,
+            )
         return SandboxHandle(
             conversation_id=spec.conversation_id,
             container_id=sandbox.id,
@@ -186,6 +195,15 @@ class CreateOSCarrier:
             turn_id=spec.turn_id,
             runtime_root=sandbox_runtime_root(spec.conversation_id),
         )
+
+    @staticmethod
+    def _proxy_rules(addresses: tuple[str, ...], port: int) -> tuple[str, ...]:
+        ips = sorted({ipaddress.ip_address(value) for value in addresses}, key=str)
+        if not ips or any(ip.version != 4 or not ip.is_global for ip in ips):
+            raise ValueError("CreateOS egress proxy must resolve to public IPv4 addresses")
+        if not 1 <= port <= 65535:
+            raise ValueError("proxy port must be between 1 and 65535")
+        return tuple(f"{ip}:{port}" for ip in ips)
 
     async def _provision(self, spec: SandboxSpec, rules: tuple[str, ...]) -> SandboxView:
         if not spec.image_ref.startswith("tpl_"):
@@ -233,22 +251,17 @@ class CreateOSCarrier:
             ),
         )
 
-    @staticmethod
-    def _proxy_rules(addresses: tuple[str, ...], port: int) -> tuple[str, ...]:
-        ips = sorted({ipaddress.ip_address(value) for value in addresses}, key=str)
-        if not ips or any(ip.version != 4 or not ip.is_global for ip in ips):
-            raise ValueError("CreateOS egress proxy must resolve to public IPv4 addresses")
-        if not 1 <= port <= 65535:
-            raise ValueError("proxy port must be between 1 and 65535")
-        return tuple(f"{ip}:{port}" for ip in ips)
-
     async def attach(self, spec: SandboxSpec) -> SandboxHandle | None:
         """Reattach an existing workspace without provisioning or granting egress credentials."""
         sandbox = await self._find(spec)
         if sandbox is None or sandbox.status in TERMINAL_STATES:
             return None
-        self._check_owner(sandbox, spec.conversation_id)
-        await self._ready(sandbox.id)
+        if owner_key(spec.conversation_id) not in sandbox.envs:
+            return None
+        try:
+            await self._ready(sandbox.id)
+        except SandboxUnreachable:
+            return None
         return SandboxHandle(
             conversation_id=spec.conversation_id,
             container_id=sandbox.id,
@@ -359,10 +372,20 @@ class CreateOSCarrier:
             )
             completed = True
             stdout = b"".join(
-                [chunk async for chunk in self._download(handle.container_id, result.stdout_path)]
+                [
+                    chunk
+                    async for chunk in self._download(
+                        handle.container_id, result.stdout_path, limit=MAX_OUTPUT_BYTES
+                    )
+                ]
             )
             stderr = b"".join(
-                [chunk async for chunk in self._download(handle.container_id, result.stderr_path)]
+                [
+                    chunk
+                    async for chunk in self._download(
+                        handle.container_id, result.stderr_path, limit=MAX_OUTPUT_BYTES
+                    )
+                ]
             )
             return ExecResult(
                 stdout=stdout.decode(errors="replace"),
@@ -379,6 +402,8 @@ class CreateOSCarrier:
     async def stop_commands(self, handle: SandboxHandle) -> None:
         """Stop only processes launched under this turn, including detached command supervisors."""
         if handle.turn_id is not None:
+            sandbox = await self._ready(handle.container_id)
+            self._check_owner(sandbox, handle.conversation_id)
             await self._guest(
                 handle.container_id,
                 Request(action="stop", turn_id=str(handle.turn_id)),
@@ -401,7 +426,10 @@ class CreateOSCarrier:
                 if not response.is_success:
                     raise ProviderError(response.status_code)
             await self._guest(
-                handle.container_id, Request(action="write", input_path=source, path=path)
+                handle.container_id,
+                Request(
+                    action="write", input_path=source, path=path, turn_id=str(handle.turn_id or "")
+                ),
             )
         finally:
             await self._guest(handle.container_id, Request(action="cleanup", path=stage.path))
@@ -412,21 +440,30 @@ class CreateOSCarrier:
         try:
             output = f"{stage.path}/output"
             await self._guest(
-                handle.container_id, Request(action="read", path=path, output_path=output)
+                handle.container_id,
+                Request(
+                    action="read", path=path, output_path=output, turn_id=str(handle.turn_id or "")
+                ),
             )
             async for chunk in self._download(handle.container_id, output):
                 yield chunk
         finally:
             await self._guest(handle.container_id, Request(action="cleanup", path=stage.path))
 
-    async def _download(self, sandbox_id: str, path: str) -> AsyncIterator[bytes]:
+    async def _download(
+        self, sandbox_id: str, path: str, *, limit: int = MAX_FILE_BYTES
+    ) -> AsyncIterator[bytes]:
         async with self._client() as client:
             async with client.stream(
                 "GET", self._path(sandbox_id, "/files"), params={"path": path}
             ) as response:
                 if not response.is_success:
                     raise ProviderError(response.status_code)
+                received = 0
                 async for chunk in response.aiter_bytes(READ_CHUNK_BYTES):
+                    received += len(chunk)
+                    if received > limit:
+                        raise ValueError(f"CreateOS download exceeds {limit} bytes")
                     yield chunk
 
     async def file_op(
@@ -470,7 +507,11 @@ class CreateOSCarrier:
         )
         command = Envelope[CommandResponse].model_validate_json(response.content).data.result
         if command.error or command.exit_code:
-            raise RuntimeError(f"CreateOS guest helper failed with exit code {command.exit_code}")
+            raise RuntimeError(
+                f"CreateOS guest helper failed with exit code {command.exit_code}. "
+                "The template must provide /opt/ufo-carrier/bin/python and the locked guest "
+                "dependencies. Preserve workspace files before replacing an incompatible sandbox."
+            )
         result = GuestResult.model_validate_json(command.stdout)
         if result.error is not None:
             if result.errno is not None:
@@ -527,12 +568,3 @@ class CreateOSCarrier:
         if not response.is_success and not (missing and response.status_code == 404):
             raise ProviderError(response.status_code)
         return response
-
-
-def manifest() -> Manifest:
-    return Manifest(
-        name=NAME,
-        version="0.1.0",
-        deploy_keys=(API_KEY_ENV,),
-        carriers=(CarrierSpec(name=NAME, factory=CreateOSCarrier.from_env, off_cluster=True),),
-    )

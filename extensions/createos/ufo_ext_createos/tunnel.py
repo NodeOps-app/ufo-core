@@ -11,7 +11,7 @@ from ufo.sdk.sandbox import DialTarget
 HANDSHAKE_TIMEOUT_SECONDS = 15
 MAX_HEADER_BYTES = 16384
 COPY_BYTES = 65536
-LOGGER = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -91,7 +91,7 @@ class CreateOSTunnels:
             asyncio.IncompleteReadError,
             asyncio.LimitOverrunError,
         ) as error:
-            LOGGER.warning(
+            logger.warning(
                 "CreateOS tunnel %s:%d closed: %s", sandbox_id, port, type(error).__name__
             )
         finally:

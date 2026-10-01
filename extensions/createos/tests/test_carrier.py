@@ -10,11 +10,11 @@ from ufo_ext_createos.carrier import (
     MAX_REQUEST_BYTES,
     CreateOSCarrier,
     SandboxView,
-    manifest,
     owner_key,
     sandbox_name,
 )
 from ufo_ext_createos.guest import Request
+from ufo_ext_createos.manifest import manifest
 
 from ufo.config import BlobConfig, Config, DatabaseConfig, SandboxConfig
 from ufo.harness.sandbox.select import select_carriers
@@ -145,7 +145,7 @@ async def test_readiness_resumes_paused_sandbox_and_handles_concurrent_resume() 
 @pytest.mark.parametrize("old_status", [None, "destroying", "destroyed", "failed"])
 @pytest.mark.parametrize("recovery", ["create", "existing", "conflict"])
 async def test_expired_handle_recovers_one_conversation_sandbox(
-    old_status: str | None, recovery: str
+    old_status: str | None, recovery: str, caplog: pytest.LogCaptureFixture
 ) -> None:
     request = replace(
         spec(),
@@ -195,6 +195,7 @@ async def test_expired_handle_recovers_one_conversation_sandbox(
     persisted = await carrier.create(replace(request, resume_id=first.container_id))
     assert first.container_id == recovered.container_id == persisted.container_id == owned["id"]
     assert creates == (0 if recovery == "existing" else 1)
+    assert "deleted files are unavailable" in caplog.text
 
 
 @pytest.mark.parametrize("status", [401, 403, 500])
@@ -401,3 +402,144 @@ async def test_preemption_abandons_output_without_stopping_remote_command() -> N
     with pytest.raises(asyncio.CancelledError):
         await task
     assert abandoned.is_set()
+
+
+async def test_attach_refuses_another_conversations_sandbox_without_resuming() -> None:
+    def response(call: httpx.Request) -> httpx.Response:
+        assert call.method == "GET"
+        return httpx.Response(
+            200,
+            json={"status": "success", "data": {"id": "sb-other", "status": "paused", "envs": []}},
+        )
+
+    carrier = CreateOSCarrier(api_key="test", _transport=httpx.MockTransport(response))
+    assert await carrier.attach(replace(spec(), resume_id="sb-other")) is None
+
+
+async def test_stop_resumes_paused_sandbox_before_recording_cancellation() -> None:
+    request = spec()
+    state = "paused"
+    stopped = False
+
+    def response(call: httpx.Request) -> httpx.Response:
+        nonlocal state, stopped
+        match call.method, call.url.path:
+            case "GET", "/v1/sandboxes/sb-owned":
+                data = {
+                    "id": "sb-owned",
+                    "status": state,
+                    "envs": [owner_key(request.conversation_id)],
+                }
+            case "POST", "/v1/sandboxes/sb-owned/resume":
+                state = "running"
+                data = {}
+            case "POST", "/v1/sandboxes/sb-owned/exec":
+                assert state == "running"
+                payload = Request.model_validate_json(json.loads(call.content)["stdin"])
+                assert payload.action == "stop" and payload.turn_id == str(request.turn_id)
+                stopped = True
+                data = {"result": {"stdout": "{}", "stderr": "", "exit_code": 0}}
+            case _:
+                raise AssertionError(f"unexpected {call.method} {call.url.path}")
+        return httpx.Response(200, json={"status": "success", "data": data})
+
+    carrier = CreateOSCarrier(api_key="test", _transport=httpx.MockTransport(response))
+    await carrier.stop_commands(
+        SandboxHandle(
+            conversation_id=request.conversation_id,
+            container_id="sb-owned",
+            turn_id=request.turn_id,
+        )
+    )
+    assert stopped
+
+
+@pytest.mark.parametrize("stream", ["stdout", "stderr"])
+async def test_excessive_output_fails_and_cleans_stage(
+    stream: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("ufo_ext_createos.carrier.MAX_OUTPUT_BYTES", 8)
+    stage = f"/var/lib/ufo-carrier/{uuid4().hex}"
+    cleaned = False
+
+    def response(call: httpx.Request) -> httpx.Response:
+        nonlocal cleaned
+        if call.method == "GET":
+            output = b"123456789" if call.url.params["path"].endswith(stream) else b""
+            return httpx.Response(200, content=output)
+        payload = Request.model_validate_json(json.loads(call.content)["stdin"])
+        match payload.action:
+            case "stage":
+                result = {"path": stage}
+            case "exec":
+                result = {
+                    "stdout_path": stage + "/stdout",
+                    "stderr_path": stage + "/stderr",
+                    "exit_code": 0,
+                    "timed_out_after_s": None,
+                }
+            case "cleanup":
+                cleaned = True
+                result = {}
+            case _:
+                raise AssertionError(payload.action)
+        return httpx.Response(
+            200,
+            json={
+                "status": "success",
+                "data": {"result": {"stdout": json.dumps(result), "stderr": "", "exit_code": 0}},
+            },
+        )
+
+    carrier = CreateOSCarrier(api_key="test", _transport=httpx.MockTransport(response))
+    handle = SandboxHandle(conversation_id=uuid4(), container_id="sb-owned")
+    with pytest.raises(ValueError, match="exceeds 8 bytes"):
+        await carrier.exec(handle, ("noisy",), 10)
+    assert cleaned
+
+
+async def test_attach_returns_none_if_sandbox_disappears_during_resume() -> None:
+    request = spec()
+    responses = iter(
+        [
+            httpx.Response(
+                200,
+                json={
+                    "status": "success",
+                    "data": {
+                        "id": "sb-owned",
+                        "status": "paused",
+                        "envs": [owner_key(request.conversation_id)],
+                    },
+                },
+            ),
+            httpx.Response(404),
+        ]
+    )
+    carrier = CreateOSCarrier(
+        api_key="test", _transport=httpx.MockTransport(lambda _: next(responses))
+    )
+    assert await carrier.attach(replace(request, resume_id="sb-owned")) is None
+
+
+async def test_incompatible_guest_reports_recovery_without_deleting_workspace() -> None:
+    def response(call: httpx.Request) -> httpx.Response:
+        assert call.method == "POST" and call.url.path == "/v1/sandboxes/sb-owned/exec"
+        return httpx.Response(
+            200,
+            json={
+                "status": "success",
+                "data": {
+                    "result": {
+                        "stdout": "",
+                        "stderr": "private provider diagnostics",
+                        "exit_code": 127,
+                    }
+                },
+            },
+        )
+
+    carrier = CreateOSCarrier(api_key="test", _transport=httpx.MockTransport(response))
+    with pytest.raises(RuntimeError, match="Preserve workspace files") as failure:
+        await carrier._guest("sb-owned", Request(action="prepare", conversation_id=str(uuid4())))
+    assert "private provider diagnostics" not in str(failure.value)

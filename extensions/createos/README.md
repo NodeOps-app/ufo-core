@@ -26,9 +26,11 @@ uv run python sandbox/build_createos_template.py \
 | Template component | Purpose |
 |---|---|
 | Linux `ufo` binary | SHA-256, ELF CPU architecture, and executable version are checked. |
-| Python, curl, Git, jq, ripgrep, CA certificates, util-linux | Shell/file operations and runtime setup. |
-| `/opt/ufo-carrier/bin/python` with Pydantic 2.13.4 | Validates the same request/result models as the host. |
-| uid/gid 1000; sudo removed | Unprivileged commands and file operations. |
+| Python and `python3-venv` | Runs the guest helper in an isolated dependency environment. |
+| curl and CA certificates | Downloads the verified client and trusts the egress proxy. |
+| Git, jq, ripgrep, util-linux | Supplies shell tools and process/runtime utilities. |
+| `/opt/ufo-carrier/bin/python` | Pydantic and all dependencies use versions and wheel hashes from `uv.lock`; pip requires hashes. |
+| uid/gid 1000; sudo removed | Runs member commands without a path to root through sudo. |
 | Root-owned skills directory, mode `0755` | Prevents member processes planting paths for trusted installers. |
 
 CreateOS permits only its named base-image tags, not digest-pinned `FROM` values. Base and apt
@@ -63,20 +65,20 @@ CreateOS treats an empty egress list as unrestricted; the carrier refuses an emp
 | Public ingress | Disabled and read back before preparing a turn. |
 | Preview/browser tunnel | Provider hop uses API authentication; loopback listener trusts processes in the host network namespace. Run ufo in a namespace without untrusted local processes. |
 | Commands and files | uid/gid 1000, with a fresh per-command proxy environment. |
+| Command output | Each stdout/stderr download is limited to 16 MiB; overflow fails instead of returning incomplete output. |
 | Trusted setup | Root; refuses writable or symlinked skills directories. |
 | Lookup | Saved ID first; missing-ID recovery scans provider pages because the API offers no name filter. |
 | Interactive PTY | Not provided. |
 
-Stopping a turn records cancellation on the sandbox's protected disk before killing its cgroup.
-The launch lock also checks this record, so delayed commands cannot start after Stop. The record
-survives guest-helper restarts and cgroup cleanup for the lifetime of the sandbox.
-
-Sandboxes idle for 30 minutes pause; reopening resumes them. Files survive pause and server
-restart. When a saved sandbox is deleted or expires, the next execution opens a replacement from
-the configured template and persists its new ID. Recovery reuses an existing conversation-named
-replacement before creating one, including after a concurrent create conflict. Deleted workspace
-files are not restored. Read-only attachment never provisions a replacement. Use CreateOS's
-operator tools to manage or delete sandboxes.
+| Lifecycle | Behavior |
+|---|---|
+| Stop | Resumes a paused sandbox, verifies ownership, then records cancellation under the launch lock before killing its cgroup. |
+| Stopped turn | Subsequent exec, read, and write requests carrying that turn ID are refused. Off-turn file browsing remains available. |
+| Stop records | One empty file per stopped turn, retained for the sandbox lifetime. No finite deletion age is safe without a bound on delayed requests. |
+| Idle sandbox | Pauses after 30 minutes; reopening resumes it with files intact. |
+| Missing saved sandbox | Reuses a conversation-named replacement or creates one, records an operator warning, and persists the new ID. Deleted files cannot be restored. |
+| Read-only attachment | Returns no handle for missing or differently owned sandboxes; never provisions. |
+| Incompatible template | Refuses unsafe skills directories or a missing guest runtime. Preserve workspace files using CreateOS operator tools before replacing the sandbox with a compatible template. Never deletes files to repair preparation. |
 
 ## Validate
 
@@ -84,14 +86,16 @@ operator tools to manage or delete sandboxes.
 make test-one FILE=extensions/createos/tests/test_carrier.py
 make test-one FILE=extensions/createos/tests/test_tunnel.py
 make test-one FILE=extensions/createos/tests/test_template.py
+make test-one FILE=extensions/createos/tests/test_messages.py
 uv run pytest -q extensions/createos/tests/test_guest.py
 UFO_CREATEOS_TEST_TEMPLATE=tpl_<template-id> \
   uv run pytest -q extensions/createos/tests/integration/test_createos_carrier.py
 ```
 
-Guest tests require Docker with privileged containers and private cgroup v2 namespaces. The opt-in
-live test creates and deletes a sandbox. It checks
-workspace persistence, command deadlines, files, permissions, private forwarding, pause/resume,
+Guest tests run the host against the real helper and install its hash-locked dependencies. They
+require Docker with privileged containers and private cgroup v2 namespaces, and run in the existing
+integration CI job. The opt-in live test creates and deletes a sandbox. It checks workspace
+persistence, command deadlines, files, permissions, private forwarding, pause/resume,
 per-turn environments, cancellation, and blocked direct internet access. A complete deployment
 also needs a model/tool call through its live ufo egress proxy to verify credential injection and
 metering.

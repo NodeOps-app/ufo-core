@@ -1,3 +1,4 @@
+import asyncio
 import json
 import shlex
 import subprocess
@@ -7,25 +8,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
+import httpx
 import pytest
-from pydantic import ValidationError
-from ufo_ext_createos.guest import Request
+from ufo_ext_createos.carrier import CreateOSCarrier, owner_key
 
-from sandbox.build_createos_template import PYDANTIC_VERSION, TemplateSource
+from sandbox.build_createos_template import TemplateSource
+from ufo.sdk.sandbox import SandboxHandle
 
 SOURCE = Path(__file__).parents[1].joinpath("ufo_ext_createos/guest.py").read_text()
 IMAGE = "python:3.12-slim"
 LINUX_ECANCELED = 125
 pytestmark = pytest.mark.docker
-
-
-def test_request_rejects_unknown_actions_and_fields() -> None:
-    with pytest.raises(ValidationError):
-        Request.model_validate({"action": "exec", "priviledged": True})
-    with pytest.raises(ValidationError):
-        Request.model_validate({"action": "arbitrary"})
-    with pytest.raises(ValidationError):
-        Request.model_validate({"action": "exec", "privileged": "false"})
 
 
 @dataclass(frozen=True)
@@ -34,7 +27,16 @@ class LinuxGuest:
 
     def request(self, action: str, **fields: object) -> dict[str, object]:
         result = subprocess.run(
-            ["docker", "exec", "-i", self.container, "python3", "-I", "-c", SOURCE],
+            [
+                "docker",
+                "exec",
+                "-i",
+                self.container,
+                "/opt/ufo-carrier/bin/python",
+                "-I",
+                "-c",
+                SOURCE,
+            ],
             input=json.dumps({"action": action, **fields}),
             text=True,
             capture_output=True,
@@ -71,17 +73,16 @@ def linux_guest() -> Iterator[LinuxGuest]:
     ).stdout.strip()
     guest = LinuxGuest(container)
     try:
+        dockerfile = TemplateSource(
+            name="ufo", client_url="https://example.com/ufo", client_sha256="0" * 64
+        ).dockerfile()
+        install = next(
+            line.removeprefix("RUN ")
+            for line in dockerfile.splitlines()
+            if line.startswith("RUN python3 -m venv")
+        )
         subprocess.run(
-            [
-                "docker",
-                "exec",
-                container,
-                "pip",
-                "install",
-                "--quiet",
-                "--no-cache-dir",
-                f"pydantic=={PYDANTIC_VERSION}",
-            ],
+            ["docker", "exec", container, "sh", "-c", install],
             check=True,
             capture_output=True,
         )
@@ -109,7 +110,7 @@ def test_prepare_and_stage_reject_user_controlled_directories(linux_guest: Linux
     result = linux_guest.request(
         "prepare", conversation_id=str(conversation), hosts="10.0.0.1 proxy.test"
     )
-    assert result == {"runtime_root": f"/home/user/.ufo/runs/{conversation.hex}"}
+    assert result == {}
     assert (
         linux_guest.request(
             "prepare", conversation_id=str(conversation), hosts="10.0.0.2 proxy.test"
@@ -363,7 +364,7 @@ def test_prepare_serializes_concurrent_same_conversation(linux_guest: LinuxGuest
             )
         )
     assert all(result == results[0] for result in results)
-    assert "runtime_root" in results[0]
+    assert results[0] == {}
     hosts = linux_guest.command("from pathlib import Path; print(Path('/etc/hosts').read_text())")
     assert hosts.count("10.0.0.3 parallel.proxy") == 1
 
@@ -498,3 +499,119 @@ def test_template_binary_check_accepts_native_elf_and_rejects_wrong_architecture
     )
     with pytest.raises(subprocess.CalledProcessError):
         linux_guest.command(check.replace("/usr/local/bin/ufo", target))
+
+
+@pytest.mark.parametrize("action", ["read", "write"])
+def test_stopped_turn_refuses_file_access(linux_guest: LinuxGuest, action: str) -> None:
+    turn = uuid4().hex
+    stage = linux_guest.request("stage")["path"]
+    target = f"/workspace/{uuid4().hex}"
+    linux_guest.command(
+        f"from pathlib import Path; Path({target!r}).write_text('original'); "
+        f"Path({stage!r}+'/input').write_text('changed')"
+    )
+    assert linux_guest.request("stop", turn_id=turn) == {}
+    result = linux_guest.request(
+        action,
+        turn_id=turn,
+        path=target,
+        input_path=f"{stage}/input",
+        output_path=f"{stage}/output",
+    )
+    assert result["errno"] == LINUX_ECANCELED
+    assert (
+        linux_guest.command(
+            f"from pathlib import Path; print(Path({target!r}).read_text())"
+        ).strip()
+        == "original"
+    )
+    assert linux_guest.request("cleanup", path=stage) == {}
+
+
+async def test_host_carrier_executes_real_guest_and_enforces_limits(
+    linux_guest: LinuxGuest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    conversation = uuid4()
+    preparation = await asyncio.create_subprocess_exec(
+        "docker",
+        "exec",
+        "-i",
+        linux_guest.container,
+        "/opt/ufo-carrier/bin/python",
+        "-I",
+        "-c",
+        SOURCE,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await preparation.communicate(
+        json.dumps({"action": "prepare", "conversation_id": str(conversation)}).encode()
+    )
+    assert preparation.returncode == 0, stderr
+    assert json.loads(stdout) == {}
+
+    async def provider(call: httpx.Request) -> httpx.Response:
+        if call.method == "GET" and call.url.path.endswith("sb-linux"):
+            return httpx.Response(
+                200,
+                json={
+                    "status": "success",
+                    "data": {
+                        "id": "sb-linux",
+                        "status": "running",
+                        "envs": [owner_key(conversation)],
+                    },
+                },
+            )
+        if call.method == "POST":
+            body = json.loads(call.content)
+            argv = (body["cmd"], *body["args"])
+            incoming = body["stdin"].encode()
+        else:
+            assert call.method == "GET" and call.url.path.endswith("/files")
+            argv = ("cat", call.url.params["path"])
+            incoming = b""
+        process = await asyncio.create_subprocess_exec(
+            "docker",
+            "exec",
+            "-i",
+            linux_guest.container,
+            *argv,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await process.communicate(incoming)
+        if call.method == "GET":
+            assert process.returncode == 0, stderr
+            return httpx.Response(200, content=stdout)
+        return httpx.Response(
+            200,
+            json={
+                "status": "success",
+                "data": {
+                    "result": {
+                        "stdout": stdout.decode(),
+                        "stderr": stderr.decode(),
+                        "exit_code": process.returncode,
+                    }
+                },
+            },
+        )
+
+    carrier = CreateOSCarrier(api_key="test", _transport=httpx.MockTransport(provider))
+    handle = SandboxHandle(conversation_id=conversation, container_id="sb-linux", turn_id=uuid4())
+    command = ("sh", "-c", "id -u; printf binary > /workspace/host-guest-probe")
+    result = await carrier.exec(handle, command, 10)
+    assert result.exit_code == 0 and result.stdout.strip() == "1000"
+    assert (
+        b"".join([part async for part in carrier.read(handle, "/workspace/host-guest-probe")])
+        == b"binary"
+    )
+    monkeypatch.setattr("ufo_ext_createos.carrier.MAX_OUTPUT_BYTES", 8)
+    with pytest.raises(ValueError, match="exceeds 8 bytes"):
+        await carrier.exec(handle, ("printf", "123456789"), 10)
+    await carrier.stop_commands(handle)
+    with pytest.raises(OSError, match="turn has been stopped"):
+        await carrier.exec(handle, ("touch", "/workspace/late-host-guest"), 10)
