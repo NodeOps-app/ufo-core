@@ -17,6 +17,7 @@ BUILD_TIMEOUT_SECONDS = 1800
 POLL_SECONDS = 5
 REQUEST_TIMEOUT_SECONDS = 30
 MAX_DOCKERFILE_BYTES = 64 * 1024
+PYDANTIC_VERSION = "2.13.4"
 
 
 class TemplateSource(BaseModel):
@@ -47,20 +48,28 @@ class TemplateSource(BaseModel):
                 "FROM nodeops/sandbox:debian",
                 "USER root",
                 "RUN apt-get update && apt-get install -y --no-install-recommends "
-                "python3 curl ca-certificates git jq ripgrep util-linux "
+                "python3 python3-venv curl ca-certificates git jq ripgrep util-linux "
                 "&& apt-get purge -y sudo && rm -rf /etc/sudoers /etc/sudoers.d "
                 "/var/lib/apt/lists/*",
+                "RUN python3 -m venv /opt/ufo-carrier && "
+                f"/opt/ufo-carrier/bin/pip install --no-cache-dir pydantic=={PYDANTIC_VERSION}",
                 "RUN curl --fail --silent --show-error --location --proto '=https' "
                 "--proto-redir '=https' "
                 f"{shlex.quote(self.client_url)} -o /usr/local/bin/ufo "
                 f"&& printf '%s\\n' '{self.client_sha256.lower()}  /usr/local/bin/ufo' "
-                "| sha256sum --check --strict - && chmod 0755 /usr/local/bin/ufo",
+                "| sha256sum --check --strict - && chmod 0755 /usr/local/bin/ufo "
+                "&& python3 -c 'import pathlib,platform,struct; "
+                'h=pathlib.Path("/usr/local/bin/ufo").read_bytes()[:20]; '
+                'assert h[:6]==b"\\x7fELF\\x02\\x01", "expected ELF64 little-endian binary"; '
+                'assert struct.unpack("<H",h[18:20])[0]=='
+                '{"x86_64":62,"aarch64":183}[platform.machine()], "wrong CPU architecture"\' '
+                "&& /usr/local/bin/ufo --version",
                 "RUN groupadd --gid 1000 user && useradd --uid 1000 --gid 1000 "
                 "--home-dir /home/user --shell /bin/bash --no-create-home user "
                 "&& install -d -o root -g root -m 0755 /home/user /home/user/.ufo "
                 "/home/user/.ufo/runs "
                 "&& install -d -o 1000 -g 1000 -m 0755 /workspace "
-                "&& install -d -o root -g root -m 1777 /home/user/.ufo/skills "
+                "&& install -d -o root -g root -m 0755 /home/user/.ufo/skills "
                 "&& install -d -o root -g root -m 0700 /var/lib/ufo-carrier "
                 "&& install -o 1000 -g 1000 -m 0600 /dev/null /home/user/.ufo/session",
                 "WORKDIR /workspace",

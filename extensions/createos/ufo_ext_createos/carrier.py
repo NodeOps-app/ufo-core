@@ -31,6 +31,7 @@ from ufo.sdk.sandbox import (
     sandbox_runtime_root,
     ufo_fs_file_op,
 )
+from ufo_ext_createos.guest import GuestResult, Request
 from ufo_ext_createos.tunnel import CreateOSTunnels
 
 NAME = "createos"
@@ -72,7 +73,7 @@ class SandboxView(BaseModel):
     ]
     name: str | None = None
     envs: list[str] = Field(default_factory=list)
-    ingress_enabled: bool = False
+    ingress_enabled: bool | None = None
 
 
 class Pagination(BaseModel):
@@ -95,16 +96,6 @@ class CommandResponse(BaseModel):
     result: CommandOutput
 
 
-class GuestResult(BaseModel):
-    path: str = ""
-    stdout_path: str = ""
-    stderr_path: str = ""
-    exit_code: int = 0
-    timed_out_after_s: int | None = None
-    error: str | None = None
-    errno: int | None = None
-
-
 class ProviderError(RuntimeError):
     """A control-plane refusal without credential-bearing request or response text."""
 
@@ -121,16 +112,6 @@ def sandbox_name(conversation_id: UUID) -> str:
 def owner_key(conversation_id: UUID) -> str:
     """Encode ownership in an immutable create-time environment key visible in GET responses."""
     return f"UFO_CONVERSATION_{conversation_id.hex}"
-
-
-def proxy_rules(addresses: tuple[str, ...], port: int) -> tuple[str, ...]:
-    """Produce a nonempty public IPv4 allowlist for the proxy's dedicated address and port."""
-    ips = sorted({ipaddress.ip_address(value) for value in addresses}, key=str)
-    if not ips or any(ip.version != 4 or not ip.is_global for ip in ips):
-        raise ValueError("CreateOS egress proxy must resolve to public IPv4 addresses")
-    if not 1 <= port <= 65535:
-        raise ValueError("proxy port must be between 1 and 65535")
-    return tuple(f"{ip}:{port}" for ip in ips)
 
 
 @dataclass(frozen=True)
@@ -191,45 +172,12 @@ class CreateOSCarrier:
             host, port, family=socket.AF_INET, type=socket.SOCK_STREAM
         )
         ips = tuple(sorted({str(address[4][0]) for address in addresses}))
-        rules = proxy_rules(ips, port)
+        rules = self._proxy_rules(ips, port)
         if sandbox is None:
-            if not spec.image_ref.startswith("tpl_"):
-                raise ValueError("CreateOS image_ref must be a prepared immutable tpl_ template ID")
-            try:
-                response = await self._request(
-                    "POST",
-                    "/v1/sandboxes",
-                    {
-                        "name": sandbox_name(spec.conversation_id),
-                        "shape": self.shape,
-                        "rootfs": spec.image_ref,
-                        "envs": {owner_key(spec.conversation_id): "1"},
-                        "ingress_enabled": False,
-                        "egress": rules,
-                        "auto_pause_after_seconds": IDLE_TIMEOUT_SECONDS,
-                    },
-                )
-                created = Envelope[SandboxView].model_validate_json(response.content).data
-                sandbox = await self._get(created.id)
-            except ProviderError as error:
-                if error.status != 409:
-                    raise
-                sandbox = await self._find(replace(spec, resume_id=None))
-            if sandbox is None:
-                raise SandboxUnreachable("CreateOS did not return the conversation sandbox")
+            sandbox = await self._provision(spec, rules)
         self._check_owner(sandbox, spec.conversation_id)
         await self._ready(sandbox.id)
-        await self._request("PATCH", self._path(sandbox.id), {"ingress_enabled": False})
-        await self._request("PUT", self._path(sandbox.id, "/egress"), {"egress": rules})
-        await self._guest(
-            sandbox.id,
-            {
-                "action": "prepare",
-                "conversation_id": str(spec.conversation_id),
-                "ca_cert": spec.proxy.ca_cert,
-                "hosts": "\n".join(f"{ip} {host}" for ip in ips),
-            },
-        )
+        await self._configure(sandbox, spec, rules, "\n".join(f"{ip} {host}" for ip in ips))
         return SandboxHandle(
             conversation_id=spec.conversation_id,
             container_id=sandbox.id,
@@ -238,6 +186,61 @@ class CreateOSCarrier:
             turn_id=spec.turn_id,
             runtime_root=sandbox_runtime_root(spec.conversation_id),
         )
+
+    async def _provision(self, spec: SandboxSpec, rules: tuple[str, ...]) -> SandboxView:
+        if not spec.image_ref.startswith("tpl_"):
+            raise ValueError("CreateOS image_ref must be a prepared immutable tpl_ template ID")
+        try:
+            response = await self._request(
+                "POST",
+                "/v1/sandboxes",
+                {
+                    "name": sandbox_name(spec.conversation_id),
+                    "shape": self.shape,
+                    "rootfs": spec.image_ref,
+                    "envs": {owner_key(spec.conversation_id): "1"},
+                    "ingress_enabled": False,
+                    "egress": rules,
+                    "auto_pause_after_seconds": IDLE_TIMEOUT_SECONDS,
+                },
+            )
+            created = Envelope[SandboxView].model_validate_json(response.content).data
+            sandbox = await self._get(created.id)
+        except ProviderError as error:
+            if error.status != 409:
+                raise
+            sandbox = await self._find(replace(spec, resume_id=None))
+        if sandbox is None:
+            raise SandboxUnreachable("CreateOS did not return the conversation sandbox")
+        return sandbox
+
+    async def _configure(
+        self, sandbox: SandboxView, spec: SandboxSpec, rules: tuple[str, ...], hosts: str
+    ) -> None:
+        await self._request("PATCH", self._path(sandbox.id), {"ingress_enabled": False})
+        confirmed = await self._get(sandbox.id)
+        if confirmed is None or confirmed.ingress_enabled is not False:
+            raise SandboxProviderUnavailable("CreateOS did not confirm disabled public ingress")
+        self._check_owner(confirmed, spec.conversation_id)
+        await self._request("PUT", self._path(sandbox.id, "/egress"), {"egress": rules})
+        await self._guest(
+            sandbox.id,
+            Request(
+                action="prepare",
+                conversation_id=str(spec.conversation_id),
+                ca_cert=spec.proxy.ca_cert,
+                hosts=hosts,
+            ),
+        )
+
+    @staticmethod
+    def _proxy_rules(addresses: tuple[str, ...], port: int) -> tuple[str, ...]:
+        ips = sorted({ipaddress.ip_address(value) for value in addresses}, key=str)
+        if not ips or any(ip.version != 4 or not ip.is_global for ip in ips):
+            raise ValueError("CreateOS egress proxy must resolve to public IPv4 addresses")
+        if not 1 <= port <= 65535:
+            raise ValueError("proxy port must be between 1 and 65535")
+        return tuple(f"{ip}:{port}" for ip in ips)
 
     async def attach(self, spec: SandboxSpec) -> SandboxHandle | None:
         """Reattach an existing workspace without provisioning or granting egress credentials."""
@@ -337,21 +340,21 @@ class CreateOSCarrier:
     ) -> ExecResult:
         if not argv or timeout_s <= 0:
             raise ValueError("command and positive timeout are required")
-        stage = await self._guest(handle.container_id, {"action": "stage"})
+        stage = await self._guest(handle.container_id, Request(action="stage"))
         completed = False
         try:
             result = await self._guest(
                 handle.container_id,
-                {
-                    "action": "exec",
-                    "path": stage.path,
-                    "argv": argv,
-                    "env": GUEST_ENV if privileged else {**GUEST_ENV, **handle.egress_env},
-                    "timeout_s": timeout_s,
-                    "turn_id": str(handle.turn_id or ""),
-                    "exec_id": uuid4().hex,
-                    "privileged": privileged,
-                },
+                Request(
+                    action="exec",
+                    path=stage.path,
+                    argv=list(argv),
+                    env=GUEST_ENV if privileged else {**GUEST_ENV, **handle.egress_env},
+                    timeout_s=timeout_s,
+                    turn_id=str(handle.turn_id or ""),
+                    exec_id=uuid4().hex,
+                    privileged=privileged,
+                ),
                 timeout_s=timeout_s + CONTROL_TIMEOUT_SECONDS,
             )
             completed = True
@@ -370,7 +373,7 @@ class CreateOSCarrier:
         finally:
             await self._guest(
                 handle.container_id,
-                {"action": "cleanup" if completed else "abandon", "path": stage.path},
+                Request(action="cleanup" if completed else "abandon", path=stage.path),
             )
 
     async def stop_commands(self, handle: SandboxHandle) -> None:
@@ -378,17 +381,14 @@ class CreateOSCarrier:
         if handle.turn_id is not None:
             await self._guest(
                 handle.container_id,
-                {
-                    "action": "stop",
-                    "turn_id": str(handle.turn_id),
-                },
+                Request(action="stop", turn_id=str(handle.turn_id)),
             )
 
     async def write(self, handle: SandboxHandle, path: str, content: bytes) -> None:
         """Stage binary bytes privately and replace the destination as the sandbox user."""
         if len(content) > MAX_FILE_BYTES:
             raise ValueError("CreateOS file upload exceeds 10 GiB")
-        stage = await self._guest(handle.container_id, {"action": "stage"})
+        stage = await self._guest(handle.container_id, Request(action="stage"))
         try:
             source = f"{stage.path}/input"
             async with self._client() as client:
@@ -401,23 +401,23 @@ class CreateOSCarrier:
                 if not response.is_success:
                     raise ProviderError(response.status_code)
             await self._guest(
-                handle.container_id, {"action": "write", "input_path": source, "path": path}
+                handle.container_id, Request(action="write", input_path=source, path=path)
             )
         finally:
-            await self._guest(handle.container_id, {"action": "cleanup", "path": stage.path})
+            await self._guest(handle.container_id, Request(action="cleanup", path=stage.path))
 
     async def read(self, handle: SandboxHandle, path: str) -> AsyncIterator[bytes]:
         """Read with sandbox-user permissions, then stream bounded chunks from private staging."""
-        stage = await self._guest(handle.container_id, {"action": "stage"})
+        stage = await self._guest(handle.container_id, Request(action="stage"))
         try:
             output = f"{stage.path}/output"
             await self._guest(
-                handle.container_id, {"action": "read", "path": path, "output_path": output}
+                handle.container_id, Request(action="read", path=path, output_path=output)
             )
             async for chunk in self._download(handle.container_id, output):
                 yield chunk
         finally:
-            await self._guest(handle.container_id, {"action": "cleanup", "path": stage.path})
+            await self._guest(handle.container_id, Request(action="cleanup", path=stage.path))
 
     async def _download(self, sandbox_id: str, path: str) -> AsyncIterator[bytes]:
         async with self._client() as client:
@@ -454,7 +454,7 @@ class CreateOSCarrier:
     async def _guest(
         self,
         sandbox_id: str,
-        payload: Mapping[str, object],
+        payload: Request,
         *,
         timeout_s: int = CONTROL_TIMEOUT_SECONDS,
     ) -> GuestResult:
@@ -462,9 +462,9 @@ class CreateOSCarrier:
             "POST",
             self._path(sandbox_id, "/exec"),
             {
-                "cmd": "python3",
+                "cmd": "/opt/ufo-carrier/bin/python",
                 "args": ["-I", "-c", GUEST_SOURCE],
-                "stdin": json.dumps(payload, separators=(",", ":")),
+                "stdin": payload.model_dump_json(exclude_defaults=True),
             },
             timeout_s=timeout_s,
         )
@@ -476,7 +476,7 @@ class CreateOSCarrier:
             if result.errno is not None:
                 raise OSError(result.errno, result.error)
             raise RuntimeError(result.error)
-        match payload["action"]:
+        match payload.action:
             case "stage":
                 path = Path(result.path)
                 if path.parent != Path("/var/lib/ufo-carrier") or UUID(path.name).hex != path.name:
@@ -485,8 +485,8 @@ class CreateOSCarrier:
                 required = {"stdout_path", "stderr_path", "exit_code", "timed_out_after_s"}
                 if (
                     not required <= result.model_fields_set
-                    or result.stdout_path != f"{payload['path']}/stdout"
-                    or result.stderr_path != f"{payload['path']}/stderr"
+                    or result.stdout_path != f"{payload.path}/stdout"
+                    or result.stderr_path != f"{payload.path}/stderr"
                 ):
                     raise RuntimeError("CreateOS guest returned an incomplete command result")
         return result

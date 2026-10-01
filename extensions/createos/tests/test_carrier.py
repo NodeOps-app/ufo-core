@@ -12,9 +12,9 @@ from ufo_ext_createos.carrier import (
     SandboxView,
     manifest,
     owner_key,
-    proxy_rules,
     sandbox_name,
 )
+from ufo_ext_createos.guest import Request
 
 from ufo.config import BlobConfig, Config, DatabaseConfig, SandboxConfig
 from ufo.harness.sandbox.select import select_carriers
@@ -41,7 +41,7 @@ def test_names_fit_provider_limit_and_ownership_uses_full_uuid() -> None:
 
 
 def test_proxy_rules_are_exact_public_addresses_and_port() -> None:
-    assert proxy_rules(("8.8.8.8", "1.1.1.1", "8.8.8.8"), 8443) == (
+    assert CreateOSCarrier._proxy_rules(("8.8.8.8", "1.1.1.1", "8.8.8.8"), 8443) == (
         "1.1.1.1:8443",
         "8.8.8.8:8443",
     )
@@ -52,7 +52,7 @@ def test_proxy_rules_never_turn_an_empty_or_private_destination_into_open_egress
     addresses: tuple[str, ...],
 ) -> None:
     with pytest.raises(ValueError):
-        proxy_rules(addresses, 443)
+        CreateOSCarrier._proxy_rules(addresses, 443)
 
 
 def test_manifest_resolves_carrier_and_requires_public_proxy(
@@ -97,6 +97,7 @@ async def test_attach_paginates_skips_destroyed_names_and_carries_no_credentials
         "id": "sb-owned",
         "name": name,
         "status": "running",
+        "ingress_enabled": False,
         "envs": [owner_key(request.conversation_id)],
     }
 
@@ -155,6 +156,7 @@ async def test_expired_handle_recovers_one_conversation_sandbox(
         "id": "sb-replacement",
         "name": sandbox_name(request.conversation_id),
         "status": "running",
+        "ingress_enabled": False,
         "envs": [owner_key(request.conversation_id)],
     }
     available = recovery == "existing"
@@ -228,7 +230,45 @@ async def test_guest_filesystem_error_retains_errno() -> None:
         ),
     )
     with pytest.raises(PermissionError):
-        await carrier._guest("sb-test", {"action": "read", "path": "/etc/shadow"})
+        await carrier._guest("sb-test", Request(action="read", path="/etc/shadow"))
+
+
+async def test_http_proxy_is_rejected_before_provisioning() -> None:
+    def response(call: httpx.Request) -> httpx.Response:
+        assert call.method == "GET"
+        return httpx.Response(
+            200, json={"status": "success", "data": {"data": [], "pagination": {"total": 0}}}
+        )
+
+    carrier = CreateOSCarrier(api_key="test-key", _transport=httpx.MockTransport(response))
+    request = replace(
+        spec(), proxy=ProxyEndpoint(port=80, ca_cert="ca", public_url="http://1.1.1.1")
+    )
+    with pytest.raises(RuntimeError, match="HTTPS"):
+        await carrier.create(request)
+
+
+@pytest.mark.parametrize("enabled", [True, None])
+async def test_create_requires_confirmed_private_ingress(enabled: bool | None) -> None:
+    request = replace(
+        spec(),
+        resume_id="sb-owned",
+        proxy=ProxyEndpoint(port=443, ca_cert="ca", public_url="https://1.1.1.1"),
+    )
+    owned = {
+        "id": "sb-owned",
+        "status": "running",
+        "envs": [owner_key(request.conversation_id)],
+        "ingress_enabled": enabled,
+    }
+
+    def response(call: httpx.Request) -> httpx.Response:
+        assert call.method in ("GET", "PATCH")
+        return httpx.Response(200, json={"status": "success", "data": owned})
+
+    carrier = CreateOSCarrier(api_key="test-key", _transport=httpx.MockTransport(response))
+    with pytest.raises(RuntimeError, match="confirm disabled public ingress"):
+        await carrier.create(request)
 
 
 async def test_create_recovers_name_conflict_and_refreshes_turn_environment() -> None:
@@ -241,6 +281,7 @@ async def test_create_recovers_name_conflict_and_refreshes_turn_environment() ->
         "id": "sb-owned",
         "name": sandbox_name(request.conversation_id),
         "status": "running",
+        "ingress_enabled": False,
         "envs": [owner_key(request.conversation_id)],
     }
     listing = iter([[], [owned]])
@@ -308,7 +349,7 @@ async def test_missing_guest_results_fail_instead_of_using_default_paths(action:
         ),
     )
     with pytest.raises(RuntimeError):
-        await carrier._guest("sb-test", {"action": action, "path": "/var/lib/ufo-carrier/test"})
+        await carrier._guest("sb-test", Request(action=action, path="/var/lib/ufo-carrier/test"))
 
 
 async def test_oversized_api_payload_is_rejected_before_network_access() -> None:

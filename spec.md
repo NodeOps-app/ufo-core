@@ -33,7 +33,7 @@ touching runtime internals.
 | Durable execution | DBOS on the same database as the schema (SQLite dev / Postgres deploys): a turn is a durable workflow, a subagent a child workflow; queues, async cancel, crash recovery. Shutdown stops admission, gives requests `[serve].request_shutdown_seconds`, waits `[serve].graceful_shutdown_seconds` for active workflows (the standalone `ufo-egress` proxy drains its own live tunnels for that same window on its own SIGTERM), then retires the executor heartbeat only if no workflow remains active — a workflow that outlives the drain keeps the seat, so no peer re-dispatches work this process still executes; the seat ages out with the process. The supervisor's termination budget exceeds the sequential drains. DBOS-on-SQLite is verified in U1 — fail loud, never silently fall back to requiring Postgres. Dequeue poll interval and system-DB retention are configured from day one. |
 | Streaming | Durable terminal frames in Postgres; live token deltas through a hub interface — in-process in the single-process default, a Redis hub extension for multi-instance deploys. A lost delta costs a redrawn token, never correctness. |
 | Topology | `ufoctl serve` is one process on one event loop: surfaces + DBOS workers + jobs, with `ufo.harness` called in-process through typed ports. The package seam is not an HTTP seam. Everything is async-native — a blocking call stalls the whole deploy, so blocking-in-async fails lint. Scale-out = more instances plus a shared hub. `--fleet` divides those instances by the durable work they claim, and a deploy runs the two the queue registry partitions into: `turns` takes the member queues and the surfaces' live delivery, `jobs` takes the background execution queue (`ufo-serve` and `ufo-jobs`, one image, one config, one composition root). Recurring job ticks remain on DBOS's shared internal scheduler queue: their bounded candidate read and enqueue fan-out can run in either fleet, while the per-workspace handler they dispatch runs only in `jobs`. Turns are model rounds and network waits; a job's chunking and embedding holds the GIL, so on one interpreter a large reindex starves the portal, the turn loop, and every surface at once. Each fleet's replica count is then its own. A single node stays one process, which claims both. |
-| Sandbox | A local temp-dir carrier is the runtime default: every command runs under the kernel's sandbox (`ufo sandbox` — Seatbelt on macOS, Landlock on Linux) with writes confined to the workspace, the conversation's `$UFO_HOME/runs/<id>`, the scratch home, and the temp dir, and the whole filesystem readable; egress is proxy-scoped/metered only for clients that honor the proxy env, not kernel-enforced (model keys still stay fail-closed via the sentinel). It is the development / trusted-input default; use Docker or E2B (carrier extensions on the `carriers` point) for untrusted input, isolation, or multi-tenant deploys. A container carrier's boundary is the kernel's. The file tools (`ufo fs`, Rust, in the image) refuse a symlink or an escape at the path they are handed; every other path the host names inside a container goes as named. A conversation opened from a connected CLI terminal takes the `client` carrier instead — its workspace is the member's own `$PWD`, its ops the member's own subprocesses — unconfined, since it is the member's own shell, offered only to a terminal the member connected. |
+| Sandbox | A local temp-dir carrier is the runtime default: every command runs under the kernel's sandbox (`ufo sandbox` — Seatbelt on macOS, Landlock on Linux) with writes confined to the workspace, the conversation's `$UFO_HOME/runs/<id>`, the scratch home, and the temp dir, and the whole filesystem readable; egress is proxy-scoped/metered only for clients that honor the proxy env, not kernel-enforced (model keys still stay fail-closed via the sentinel). It is the development / trusted-input default; use Docker, E2B, or CreateOS (carrier extensions on the `carriers` point) for untrusted input, isolation, or multi-tenant deploys. A container carrier's boundary is the kernel's. The file tools (`ufo fs`, Rust, in the image) refuse a symlink or an escape at the path they are handed; every other path the host names inside a container goes as named. A conversation opened from a connected CLI terminal takes the `client` carrier instead — its workspace is the member's own `$PWD`, its ops the member's own subprocesses — unconfined, since it is the member's own shell, offered only to a terminal the member connected. |
 | Models | Model providers are an extension point; the runtime ships Anthropic + OpenAI direct clients behind one `ModelClient` interface. OpenRouter ships as an extension. |
 | Observability | OpenTelemetry APIs only in product code; the OTLP export target (Datadog, …) is deploy config. No vendor SDK in the runtime. The operator debugger projects an opened turn's DBOS steps with their timestamps and durations, and links the turn to the pages `[debugger] turn_urls` names (its trace, its logs), filled from its `traceparent`, its conversation, and its window. Output the process did not write crosses on one record only: a tool call that did not end ok warns with the error result's text — bounded to the tool result cap, its credential shapes (a URL's userinfo, an Authorization header's value) scrubbed by value — so an operator reads what failed off the record rather than off a counter; that the text can echo the environment the failing command ran under, or a member's own secret, is a risk accepted for that record and no other. |
 | Kubernetes | Absent from the runtime by construction. The enterprise offering wraps the runtime with k8s (principle 3); no runtime module may assume or import it. |
@@ -127,7 +127,7 @@ contracts:
 | Reach | Holds |
 |---|---|
 | Workspaces | `ufoctl init` founds a deploy's one workspace; a second exists only where an extension provisions it and signs members in. An operator verb acts on the workspace `--workspace-id` names. Without it, `turn cancel` and `turn steps` act on the turn's own workspace, and every other verb on the one workspace, refusing a deploy that holds several. |
-| Sandboxes | The local carrier reads the whole host filesystem, so workspaces on one deploy are isolated from each other's sandboxes only under a container carrier (Docker, E2B). |
+| Sandboxes | The local carrier reads the whole host filesystem, so workspaces on one deploy are isolated from each other's sandboxes only under a container carrier (Docker, E2B, CreateOS). |
 
 Tables (all keyed by `workspace_id`, `created_at`, `updated_at`):
 
@@ -477,7 +477,8 @@ The `createos` carrier extension provisions one persistent sandbox per conversat
 immutable `tpl_` template. It uses asynchronous HTTPS control calls, a provider-enforced allowlist
 containing only the public egress proxy's IPv4 addresses and port, and authenticated TCP tunnels
 bound to host loopback for inbound services. Public sandbox ingress stays disabled. Commands and
-file access run as uid/gid 1000; CA installation and trusted skill setup run as root. Each exec
+file access run as uid/gid 1000; CA installation and trusted skill setup run as root. The skills
+namespace is root-owned and not member-writable; host and guest share validated message models. Each exec
 receives its own run-token environment. The stored `createos:<id>` handle and full conversation
 ownership marker govern reattachment. Opening a deleted or expired sandbox recovers a replacement
 by conversation name or creates one from the template; the conversation stores its new handle.
@@ -487,9 +488,9 @@ supervisor enforces command deadlines and turn-scoped cancellation. Stop records
 protected disk under the launch lock; subsequent execs for that turn are refused even after its
 cgroup is removed.
 
-Server-hosted turns execute tools in a sandbox with a baked toolchain and default-deny network
-egress with exactly one route out — the sandbox proxy. Docker uses a pinned image; remote carrier
-extensions supply the same boundary through their providers. A sandbox belongs to a
+Every turn executes tools through its bound sandbox carrier. Container and remote VM carriers
+provide a baked toolchain and default-deny network egress through the sandbox proxy. Docker uses a
+pinned image; remote carrier extensions supply that boundary through their providers. A sandbox belongs to a
 conversation, and a subagent turn executes in the sandbox of the turn that spawned it — one
 filesystem for a whole spawn tree, so a file a child leaves in `/workspace` is the handoff back to
 its parent, and co-residency is the cost: session state at fixed paths, one serving port, one
@@ -576,7 +577,7 @@ its apiserver-rewrite / token-mint module through this same rewriter seam.
 
 `/workspace` is the carrier's own storage and the only copy of a conversation's member files: a host
 directory an in-cluster carrier bind-mounts (local, Docker), the sandbox's own disk off-cluster
-(E2B, whose provider suspends an idle sandbox and keeps it indefinitely), the member's own `$PWD`
+(E2B and CreateOS preserve the sandbox disk while paused), the member's own `$PWD`
 for the `client` carrier. ufo-owned task journals, offloaded results, REPL state, monitor output,
 source change logs, clipboard images, and staging files live under
 `$UFO_HOME/runs/<id>/{tasks,tool-output,repl,monitors,sources,images,staging}`. The id is the
@@ -591,9 +592,11 @@ itself refuses any other body. Everything that touches workspace files goes thro
 a turn's tools, a surface landing an inbound attachment, a job appending a change log, the
 operator's file browser — and reclaiming a container is the carrier's own business: the Docker
 carrier stops its idle containers and any later touch starts one again (the bind mount and the
-container persist), and nothing may reclaim a container whose disk is the workspace. Carrier interface: `create / attach / exec / write / read / file_op / dial` — a local
-carrier is core's default and the `client` carrier (the connected terminal) is core's too; Docker
-and E2B implement it as extensions on the `carriers` point. A conversation's durable
+container persist). Carriers pause rather than delete sandboxes whose disks hold the workspace;
+provider or operator deletion invokes the carrier's recovery policy and cannot restore those files.
+Carrier interface: `create / attach / exec / write / read / file_op / dial` — a local
+carrier is core's default and the `client` carrier (the connected terminal) is core's too; Docker,
+E2B, and CreateOS implement it as extensions on the `carriers` point. A conversation's durable
 handle is `<backend>:<id>`, and the scheme routes: `[sandbox] backend` names where new sandboxes
 open, `[sandbox] resume_backends` keeps prior backends live for the handles bearing their scheme —
 a deploy moves providers without stranding the workspaces the old one still holds.
@@ -646,7 +649,7 @@ Manifest registers (each optional):
 | `deploy_routes` | Endpoints a deploy's own service calls, mounted at `/internal/<name>/<path>` behind a constant-time bearer check against `deploy_bearer_env`, which must be one of `deploy_keys`; `serve` fails boot when it is unset. The handler gets a `DeployContext`: `provision` (the founding seat), `bound(workspace_id)` (transaction, profiles, member model key, store), and cross-workspace reads through the owner pool — `memberships`, `workspaces_by_first_domain`, `first_member_emails`, `workspace_count`, `workspace_ids`, `seated_members`, `owner_transaction` — each taking a required `audit` that logs `deploy.cross_workspace_read` with the route and extension — plus `flag_backend` and `flag_keys` (core's and the pack's), so a flag-service write refuses a deploy it does not serve and a key no code reads. First-party distributions only. |
 | `commands` | Operator verbs, `ufoctl <name> <command> --<field> <value>`: each field of the params model is one option, the command runs with a `DeployContext` and prints the line it returns; `CommandRefused` exits 1 with its message. A name that is one of `ufoctl`'s own verbs fails. First-party distributions only. |
 | `models` | Model providers behind `ModelClient` (OpenRouter, local runtimes). |
-| `carriers` | Sandbox carriers — Docker, E2B, remote runners; core's defaults are a local temp-dir carrier and the `client` carrier (a connected CLI terminal's own directory). |
+| `carriers` | Sandbox carriers — Docker, E2B, CreateOS, remote runners; core's defaults are a local temp-dir carrier and the `client` carrier (a connected CLI terminal's own directory). |
 | `indexes` | Index backends for memory/source retrieval; the dialect-native default (SQLite FTS5 + local cosine, Postgres tsvector + pgvector) ships as the base-pinned `index_default` extension registering name `"default"`, which core resolves when `memory.index_backend` is unset. |
 | `embeds` | Embedding backends behind `EmbedClient`, selected by `memory.embed_backend`; OpenAI text-embedding-3-large ships as the base-pinned `embed_openai` extension registering name `"default"`. |
 | `hubs` | Stream hubs for multi-instance deploys (Redis). |
@@ -1384,7 +1387,7 @@ bundle installs OSS, on-prem, or hosted.
 | OpenRouter (any model router) | models, deploy_keys |
 | Brief pipeline (typed outline → draft → critic stages the agent chains) | subagents, skills |
 | Composio / Pipedream connector brokers | connectors, routes (OAuth), deploy_keys |
-| Docker, E2B | carriers |
+| Docker, E2B, CreateOS | carriers |
 | Redis stream hub | hubs |
 | Open feature-flag backend | flag_providers |
 | GitHub / Asana / Google Ads feed-sync sources | sources, credentials, auth_proxies (`direct`), deploy_keys |

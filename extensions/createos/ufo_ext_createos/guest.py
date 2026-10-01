@@ -1,7 +1,6 @@
 import errno
 import fcntl
 import hashlib
-import json
 import os
 import pwd
 import shutil
@@ -9,42 +8,60 @@ import stat
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
+from typing import Literal
 from uuid import UUID, uuid4
+
+from pydantic import BaseModel, ConfigDict, Field
 
 USER_ID = 1000
 GROUP_ID = 1000
 STAGE_ROOT = Path("/var/lib/ufo-carrier")
 STOPPED_ROOT = STAGE_ROOT / "stopped"
 HOME_ROOT = Path("/home/user")
+SKILLS_ROOT = HOME_ROOT / ".ufo/skills"
 CGROUP_ROOT = Path("/sys/fs/cgroup/ufo-carrier")
 COPY_CHUNK_SIZE = 1024 * 1024
 
 
-@dataclass(frozen=True)
-class Request:
-    action: str
+class Request(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    action: Literal["prepare", "stage", "exec", "abandon", "stop", "write", "read", "cleanup"]
     conversation_id: str = ""
     ca_cert: str = ""
     hosts: str = ""
     path: str = ""
     input_path: str = ""
     output_path: str = ""
-    argv: list[str] = field(default_factory=list)
-    env: dict[str, str] = field(default_factory=dict)
-    timeout_s: float = 60
+    argv: list[str] = Field(default_factory=list)
+    env: dict[str, str] = Field(default_factory=dict)
+    timeout_s: int = Field(default=60, gt=0)
     turn_id: str = ""
     exec_id: str = ""
     privileged: bool = False
+
+
+class GuestResult(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    path: str = ""
+    runtime_root: str = ""
+    stdout_path: str = ""
+    stderr_path: str = ""
+    exit_code: int = 0
+    timed_out_after_s: int | None = None
+    error: str | None = None
+    errno: int | None = None
 
 
 @dataclass(frozen=True)
 class Guest:
     request: Request
 
-    def run(self) -> dict[str, str | int | float | None]:
+    def run(self) -> dict[str, str | int | None]:
         """Execute one trusted host request inside the sandbox."""
         if os.geteuid() != 0:
             raise PermissionError(errno.EPERM, "carrier requires root")
@@ -93,7 +110,7 @@ class Guest:
                 raise ValueError("unknown guest action")
         return {}
 
-    def _prepare(self) -> dict[str, str | int | float | None]:
+    def _prepare(self) -> dict[str, str | int | None]:
         user = pwd.getpwuid(USER_ID)
         if user.pw_gid != GROUP_ID or user.pw_dir != str(HOME_ROOT):
             raise ValueError("sandbox user must have uid/gid 1000 and /home/user home")
@@ -102,6 +119,7 @@ class Guest:
             raise FileNotFoundError(errno.ENOENT, "sandbox image requires /usr/local/bin/ufo")
         for path in (HOME_ROOT, HOME_ROOT / ".ufo", HOME_ROOT / ".ufo/runs"):
             self._root_directory(path, 0o755)
+        self._root_directory(SKILLS_ROOT, 0o755)
         workspace = Path("/workspace")
         metadata = workspace.lstat()
         if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid not in (0, USER_ID):
@@ -167,16 +185,18 @@ class Guest:
             raise PermissionError(errno.EPERM, "unsafe stage directory")
         return path
 
-    def _exec(self) -> dict[str, str | int | float | None]:
+    def _exec(self) -> dict[str, str | int | None]:
         stage = self._stage(self.request.path)
         if not self.request.exec_id or self.request.timeout_s <= 0:
             raise ValueError("exec requires an identifier and a positive timeout")
         stdout_path = stage / "stdout"
         stderr_path = stage / "stderr"
-        timed_out: float | None = None
+        timed_out: int | None = None
         with stdout_path.open("xb") as stdout, stderr_path.open("xb") as stderr:
             with (STAGE_ROOT / "prepare.lock").open("a") as lock:
                 fcntl.flock(lock, fcntl.LOCK_EX)
+                if self.request.privileged:
+                    self._root_directory(SKILLS_ROOT, 0o755)
                 self._root_directory(CGROUP_ROOT, 0o700)
                 self._prune_groups()
                 turn = CGROUP_ROOT / hashlib.sha256(self.request.turn_id.encode()).hexdigest()
@@ -291,8 +311,12 @@ class Guest:
 
 if __name__ == "__main__":
     try:
-        print(json.dumps(Guest(Request(**json.load(sys.stdin))).run()))
+        print(
+            GuestResult.model_validate(
+                Guest(Request.model_validate_json(sys.stdin.read())).run()
+            ).model_dump_json(exclude_unset=True)
+        )
     except OSError as error:
-        print(json.dumps({"error": str(error), "errno": error.errno}))
+        print(GuestResult(error=str(error), errno=error.errno).model_dump_json(exclude_unset=True))
     except (ValueError, TypeError) as error:
-        print(json.dumps({"error": str(error), "errno": errno.EINVAL}))
+        print(GuestResult(error=str(error), errno=errno.EINVAL).model_dump_json(exclude_unset=True))

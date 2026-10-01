@@ -23,9 +23,17 @@ uv run python sandbox/build_createos_template.py \
   --client-sha256 <sha256>
 ```
 
-The builder downloads and verifies the binary, installs the shell/file toolchain, and prepares the
-unprivileged `user` account and protected runtime directories. Install any extra tools required by
-your extensions in the template, such as Node.js and Chromium for browser automation.
+| Template component | Purpose |
+|---|---|
+| Linux `ufo` binary | SHA-256, ELF CPU architecture, and executable version are checked. |
+| Python, curl, Git, jq, ripgrep, CA certificates, util-linux | Shell/file operations and runtime setup. |
+| `/opt/ufo-carrier/bin/python` with Pydantic 2.13.4 | Validates the same request/result models as the host. |
+| uid/gid 1000; sudo removed | Unprivileged commands and file operations. |
+| Root-owned skills directory, mode `0755` | Prevents member processes planting paths for trusted installers. |
+
+CreateOS permits only its named base-image tags, not digest-pinned `FROM` values. Base and apt
+package inputs are therefore not fully reproducible; the completed `tpl_` image is immutable.
+Install any extra tools your extensions need, such as Node.js and Chromium, in the template.
 
 ## Configure
 
@@ -50,10 +58,14 @@ dedicated public IPv4 addresses and port. It is not the chat server URL. The car
 those destinations at sandbox creation and refreshes the policy and guest CA when opening a turn.
 CreateOS treats an empty egress list as unrestricted; the carrier refuses an empty policy.
 
-Preview and browser ports use authenticated private TCP tunnels. They do not enable public
-CreateOS ingress. Commands and file access run as uid/gid 1000; trusted skill setup and CA
-installation run as root. Each command receives its own environment, including its current
-proxy token. Interactive PTY attachment is not provided by this carrier.
+| Boundary | Behavior |
+|---|---|
+| Public ingress | Disabled and read back before preparing a turn. |
+| Preview/browser tunnel | Provider hop uses API authentication; loopback listener trusts processes in the host network namespace. Run ufo in a namespace without untrusted local processes. |
+| Commands and files | uid/gid 1000, with a fresh per-command proxy environment. |
+| Trusted setup | Root; refuses writable or symlinked skills directories. |
+| Lookup | Saved ID first; missing-ID recovery scans provider pages because the API offers no name filter. |
+| Interactive PTY | Not provided. |
 
 Stopping a turn records cancellation on the sandbox's protected disk before killing its cgroup.
 The launch lock also checks this record, so delayed commands cannot start after Stop. The record

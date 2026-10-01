@@ -94,6 +94,7 @@ async def test_live_createos_carrier() -> None:
         )
         loaded = roots["transfer-probe"] + "/reference.txt"
         assert b"".join([chunk async for chunk in carrier.read(handle, loaded)]) == skill_content
+        assert (await sandbox.sh("test -w /home/user/.ufo/skills")).exit_code != 0
         deadline = await sandbox.sh("sleep 30", timeout_s=1)
         assert deadline.exit_code == 124 and deadline.timed_out_after_s == 1
         chosen = await sandbox.sh("exit 124")
@@ -171,6 +172,10 @@ async def test_live_createos_carrier() -> None:
             await second.stop_commands(resumed)
             assert (await asyncio.wait_for(first, 15)).exit_code != 0
             assert not other.done()
+            with pytest.raises(OSError, match="turn has been stopped"):
+                await second.exec(resumed, ("touch", "/workspace/late-command"), 10)
+            with pytest.raises(FileNotFoundError):
+                _ = [chunk async for chunk in second.read(resumed, "/workspace/late-command")]
             await second.write(sibling, "/workspace/release", b"")
             assert (await asyncio.wait_for(other, 15)).exit_code == 0
         finally:

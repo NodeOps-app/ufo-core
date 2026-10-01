@@ -40,10 +40,13 @@ def test_template_keeps_runtime_ancestors_root_owned_and_workspace_writable() ->
     assert "--uid 1000 --gid 1000" in dockerfile
     assert "-o root -g root -m 0755 /home/user /home/user/.ufo /home/user/.ufo/runs" in dockerfile
     assert "-o 1000 -g 1000 -m 0755 /workspace" in dockerfile
-    assert "-o root -g root -m 1777 /home/user/.ufo/skills" in dockerfile
+    assert "-o root -g root -m 0755 /home/user/.ufo/skills" in dockerfile
     assert "-o root -g root -m 0700 /var/lib/ufo-carrier" in dockerfile
     assert "-o 1000 -g 1000 -m 0600 /dev/null /home/user/.ufo/session" in dockerfile
     assert "apt-get purge -y sudo" in dockerfile
+    assert "/opt/ufo-carrier/bin/pip install --no-cache-dir pydantic==" in dockerfile
+    assert "wrong CPU architecture" in dockerfile
+    assert "/usr/local/bin/ufo --version" in dockerfile
 
 
 def test_artifact_url_is_one_shell_argument() -> None:

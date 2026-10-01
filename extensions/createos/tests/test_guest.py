@@ -1,4 +1,5 @@
 import json
+import shlex
 import subprocess
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
@@ -7,11 +8,24 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
+from pydantic import ValidationError
+from ufo_ext_createos.guest import Request
+
+from sandbox.build_createos_template import PYDANTIC_VERSION, TemplateSource
 
 SOURCE = Path(__file__).parents[1].joinpath("ufo_ext_createos/guest.py").read_text()
 IMAGE = "python:3.12-slim"
 LINUX_ECANCELED = 125
 pytestmark = pytest.mark.docker
+
+
+def test_request_rejects_unknown_actions_and_fields() -> None:
+    with pytest.raises(ValidationError):
+        Request.model_validate({"action": "exec", "priviledged": True})
+    with pytest.raises(ValidationError):
+        Request.model_validate({"action": "arbitrary"})
+    with pytest.raises(ValidationError):
+        Request.model_validate({"action": "exec", "privileged": "false"})
 
 
 @dataclass(frozen=True)
@@ -57,6 +71,20 @@ def linux_guest() -> Iterator[LinuxGuest]:
     ).stdout.strip()
     guest = LinuxGuest(container)
     try:
+        subprocess.run(
+            [
+                "docker",
+                "exec",
+                container,
+                "pip",
+                "install",
+                "--quiet",
+                "--no-cache-dir",
+                f"pydantic=={PYDANTIC_VERSION}",
+            ],
+            check=True,
+            capture_output=True,
+        )
         subprocess.run(
             ["docker", "exec", container, "mount", "-o", "remount,rw", "/sys/fs/cgroup"],
             check=True,
@@ -404,3 +432,69 @@ def test_abandon_reclaims_stage_when_execution_setup_fails(linux_guest: LinuxGue
         linux_guest.command(f"from pathlib import Path; print(Path({stage!r}).exists())").strip()
         == "False"
     )
+
+
+def test_skills_namespace_rejects_member_symlinks_and_unsafe_privileged_setup(
+    linux_guest: LinuxGuest,
+) -> None:
+    assert "error" not in linux_guest.request("prepare", conversation_id=str(uuid4()))
+    skills = "/home/user/.ufo/skills"
+    victim = f"/tmp/{uuid4().hex}"
+    link = skills + "/.system-manifest-attack"
+    linux_guest.command(f"from pathlib import Path; Path({victim!r}).write_text('original')")
+    stage = linux_guest.request("stage")["path"]
+    result = linux_guest.request(
+        "exec",
+        path=stage,
+        exec_id=uuid4().hex,
+        argv=["python3", "-c", f"import os; os.symlink({victim!r},{link!r})"],
+        env={"PATH": "/usr/local/bin:/usr/bin:/bin"},
+    )
+    assert result["exit_code"] != 0
+    assert linux_guest.command(f"import os; print(os.path.lexists({link!r}))").strip() == "False"
+    assert linux_guest.request("cleanup", path=stage) == {}
+    linux_guest.command(f"import os; os.chmod({skills!r},0o1777); os.symlink({victim!r},{link!r})")
+    stage = linux_guest.request("stage")["path"]
+    try:
+        result = linux_guest.request(
+            "exec",
+            path=stage,
+            exec_id=uuid4().hex,
+            privileged=True,
+            argv=[
+                "python3",
+                "-c",
+                f"from pathlib import Path; Path({link!r}).write_text('changed')",
+            ],
+            env={"PATH": "/usr/local/bin:/usr/bin:/bin"},
+        )
+        assert result["errno"] == 1
+        assert linux_guest.request("prepare", conversation_id=str(uuid4()))["errno"] == 1
+        assert (
+            linux_guest.command(
+                f"from pathlib import Path; print(Path({victim!r}).read_text())"
+            ).strip()
+            == "original"
+        )
+    finally:
+        linux_guest.command(f"import os; os.unlink({link!r}); os.chmod({skills!r},0o755)")
+        assert linux_guest.request("cleanup", path=stage) == {}
+
+
+def test_template_binary_check_accepts_native_elf_and_rejects_wrong_architecture(
+    linux_guest: LinuxGuest,
+) -> None:
+    dockerfile = TemplateSource(
+        name="ufo", client_url="https://example.com/ufo", client_sha256="0" * 64
+    ).dockerfile()
+    download = next(line for line in dockerfile.splitlines() if line.startswith("RUN curl"))
+    args = shlex.split(download)
+    check = args[args.index("-c") + 1]
+    assert linux_guest.command(check.replace("/usr/local/bin/ufo", "/usr/local/bin/python3")) == ""
+    target = f"/tmp/{uuid4().hex}"
+    linux_guest.command(
+        f"from pathlib import Path; h=bytearray(Path('/usr/local/bin/python3').read_bytes()[:20]); "
+        f"h[18:20]=b'\\x00\\x00'; Path({target!r}).write_bytes(h)"
+    )
+    with pytest.raises(subprocess.CalledProcessError):
+        linux_guest.command(check.replace("/usr/local/bin/ufo", target))

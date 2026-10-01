@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import logging
 import ssl
 from dataclasses import dataclass, field
 from functools import partial
@@ -10,6 +11,7 @@ from ufo.sdk.sandbox import DialTarget
 HANDSHAKE_TIMEOUT_SECONDS = 15
 MAX_HEADER_BYTES = 16384
 COPY_BYTES = 65536
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -79,15 +81,19 @@ class CreateOSTunnels:
                 asyncio.create_task(self._copy(reader, upstream)),
                 asyncio.create_task(self._copy(remote, writer)),
             ]
-            await asyncio.wait(copies, return_when=asyncio.FIRST_COMPLETED)
+            completed, _ = await asyncio.wait(copies, return_when=asyncio.FIRST_COMPLETED)
+            for task in completed:
+                task.result()
         except (
             OSError,
             ValueError,
             TimeoutError,
             asyncio.IncompleteReadError,
             asyncio.LimitOverrunError,
-        ):
-            pass
+        ) as error:
+            LOGGER.warning(
+                "CreateOS tunnel %s:%d closed: %s", sandbox_id, port, type(error).__name__
+            )
         finally:
             for task in copies:
                 task.cancel()

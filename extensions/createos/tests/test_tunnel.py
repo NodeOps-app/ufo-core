@@ -87,7 +87,9 @@ async def test_tunnel_preserves_coalesced_bytes_and_binary_payloads() -> None:
         b"HTTP/1.1 101 Switching Protocols\r\nX-Large: " + b"a" * MAX_HEADER_BYTES + b"\r\n\r\n",
     ],
 )
-async def test_rejected_upgrade_closes_connection_without_forwarding(response: bytes) -> None:
+async def test_rejected_upgrade_closes_connection_without_forwarding(
+    response: bytes, caplog: pytest.LogCaptureFixture
+) -> None:
     async with tunnel_peer(response) as (tunnels, _, closed):
         target = await tunnels.dial("sb-example", 8080)
         host, port = target.host.split(":")
@@ -95,6 +97,8 @@ async def test_rejected_upgrade_closes_connection_without_forwarding(response: b
         try:
             assert await reader.read() == b""
             await closed.wait()
+            assert "CreateOS tunnel sb-example:8080 closed:" in caplog.text
+            assert "secret" not in caplog.text
         finally:
             writer.close()
             await writer.wait_closed()
