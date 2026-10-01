@@ -483,7 +483,9 @@ ownership marker govern reattachment. Opening a deleted or expired sandbox recov
 by conversation name or creates one from the template; the conversation stores its new handle.
 Deleted workspace files are not restored, and read-only attachment never provisions a replacement.
 Provider idle pause preserves the workspace, and opening it resumes it. The carrier's guest
-supervisor enforces command deadlines and turn-scoped cancellation.
+supervisor enforces command deadlines and turn-scoped cancellation. Stop records cancellation on
+protected disk under the launch lock; subsequent execs for that turn are refused even after its
+cgroup is removed.
 
 Server-hosted turns execute tools in a sandbox with a baked toolchain and default-deny network
 egress with exactly one route out — the sandbox proxy. Docker uses a pinned image; remote carrier

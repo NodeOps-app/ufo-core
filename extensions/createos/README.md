@@ -55,6 +55,10 @@ CreateOS ingress. Commands and file access run as uid/gid 1000; trusted skill se
 installation run as root. Each command receives its own environment, including its current
 proxy token. Interactive PTY attachment is not provided by this carrier.
 
+Stopping a turn records cancellation on the sandbox's protected disk before killing its cgroup.
+The launch lock also checks this record, so delayed commands cannot start after Stop. The record
+survives guest-helper restarts and cgroup cleanup for the lifetime of the sandbox.
+
 Sandboxes idle for 30 minutes pause; reopening resumes them. Files survive pause and server
 restart. When a saved sandbox is deleted or expires, the next execution opens a replacement from
 the configured template and persists its new ID. Recovery reuses an existing conversation-named

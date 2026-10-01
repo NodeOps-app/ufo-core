@@ -10,6 +10,7 @@ import pytest
 
 SOURCE = Path(__file__).parents[1].joinpath("ufo_ext_createos/guest.py").read_text()
 IMAGE = "python:3.12-slim"
+LINUX_ECANCELED = 125
 pytestmark = pytest.mark.docker
 
 
@@ -275,6 +276,51 @@ def test_timeout_kills_detached_descendant_and_stop_preserves_sibling(
     )
     linux_guest.request("stop", turn_id="sibling-turn")
     linux_guest.request("cleanup", path=stage)
+
+
+@pytest.mark.parametrize("started", [False, True])
+def test_stop_prevents_delayed_launches_without_blocking_other_turns(
+    linux_guest: LinuxGuest, started: bool
+) -> None:
+    turn = str(uuid4())
+    target = f"/workspace/{uuid4().hex}"
+    stages = [linux_guest.request("stage")["path"] for _ in range(4)]
+    if started:
+        result = linux_guest.request(
+            "exec", path=stages[0], exec_id=uuid4().hex, turn_id=turn, argv=["/bin/true"]
+        )
+        assert result["exit_code"] == 0
+        linux_guest.request("cleanup", path=stages[0])
+        stages[0] = linux_guest.request("stage")["path"]
+    assert linux_guest.request("stop", turn_id=turn) == {}
+    assert linux_guest.request("stop", turn_id=turn) == {}
+    with ThreadPoolExecutor(max_workers=4) as workers:
+        results = list(
+            workers.map(
+                lambda stage: linux_guest.request(
+                    "exec",
+                    path=stage,
+                    exec_id=uuid4().hex,
+                    turn_id=turn,
+                    argv=["/usr/bin/touch", target],
+                    privileged=stage == stages[0],
+                ),
+                stages,
+            )
+        )
+    assert all(result.get("errno") == LINUX_ECANCELED for result in results)
+    assert (
+        linux_guest.command(f"from pathlib import Path; print(Path({target!r}).exists())").strip()
+        == "False"
+    )
+    for stage in stages:
+        assert linux_guest.request("cleanup", path=stage) == {}
+    stage = linux_guest.request("stage")["path"]
+    result = linux_guest.request(
+        "exec", path=stage, exec_id=uuid4().hex, turn_id=str(uuid4()), argv=["/bin/true"]
+    )
+    assert result["exit_code"] == 0
+    assert linux_guest.request("cleanup", path=stage) == {}
 
 
 def test_prepare_serializes_concurrent_same_conversation(linux_guest: LinuxGuest) -> None:

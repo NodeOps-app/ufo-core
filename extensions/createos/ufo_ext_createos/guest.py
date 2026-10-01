@@ -17,6 +17,7 @@ from uuid import UUID, uuid4
 USER_ID = 1000
 GROUP_ID = 1000
 STAGE_ROOT = Path("/var/lib/ufo-carrier")
+STOPPED_ROOT = STAGE_ROOT / "stopped"
 HOME_ROOT = Path("/home/user")
 CGROUP_ROOT = Path("/sys/fs/cgroup/ufo-carrier")
 COPY_CHUNK_SIZE = 1024 * 1024
@@ -179,6 +180,8 @@ class Guest:
                 self._root_directory(CGROUP_ROOT, 0o700)
                 self._prune_groups()
                 turn = CGROUP_ROOT / hashlib.sha256(self.request.turn_id.encode()).hexdigest()
+                if self.request.turn_id and (STOPPED_ROOT / turn.name).exists():
+                    raise OSError(errno.ECANCELED, "turn has been stopped")
                 self._root_directory(turn, 0o700)
                 group = turn / UUID(self.request.exec_id).hex
                 group.mkdir(mode=0o700)
@@ -246,6 +249,8 @@ class Guest:
             fcntl.flock(lock, fcntl.LOCK_EX)
             self._root_directory(CGROUP_ROOT, 0o700)
             turn = CGROUP_ROOT / hashlib.sha256(self.request.turn_id.encode()).hexdigest()
+            self._root_directory(STOPPED_ROOT, 0o700)
+            (STOPPED_ROOT / turn.name).touch(mode=0o600)
             if turn.exists():
                 (turn / "cgroup.kill").write_text("1")
             self._prune_groups()
