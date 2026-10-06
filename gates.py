@@ -1791,6 +1791,8 @@ ENVIRON_KEY_METHODS = frozenset({"get", "pop", "setdefault"})
 ENV_SETTINGS = frozenset(
     {
         "BROWSERBASE_PROXIES",
+        "CREATEOS_SANDBOX_BASE_URL",
+        "CREATEOS_SANDBOX_SHAPE",
         "COMPOSIO_AUTH_CONFIGS",
         "PIPEDREAM_ATTIO_OAUTH_APP_ID",
         "PIPEDREAM_LINEAR_OAUTH_APP_ID",
